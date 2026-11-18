@@ -11,8 +11,8 @@ import httpx
 
 from support.llm import merge_extra_body
 from paths import data_root
-from outfit_policy import automatic_outfit, DAILY_DEFAULTS
-from asset_index import OutfitIndex, atomic_json, parse_object, provider_id
+from outfit_policy import StoryOutfits
+from asset_index import OutfitIndex
 
 
 class WardrobeError(ValueError):
@@ -20,46 +20,6 @@ class WardrobeError(ValueError):
 
 
 OUTFIT_ID = re.compile(r"(?:stand|stand_costume)/\d{10}\Z")
-
-
-def validate_outfit_plan(raw, pending, scenes, allowed):
-    """Normalize equivalent provider shapes, then validate every identity strictly."""
-    if not isinstance(raw, dict):
-        raise WardrobeError('衣装选择不完整或不存在：结果需要JSON对象')
-    if 'outfits' not in raw:
-        rows = raw.get('choices', raw.get('scenes'))
-        if not isinstance(rows, list):
-            raise WardrobeError('衣装选择不完整或不存在：缺少outfits对象或choices场景列表')
-        selected, events = {}, {}
-        for row in rows:
-            if not isinstance(row, dict) or type(row.get('scene')) is not int:
-                raise WardrobeError('衣装选择不完整或不存在：scene必须为输入中的整数序号')
-            key = str(row['scene'])
-            if key in selected:
-                raise WardrobeError('衣装选择不完整或不存在：场景序号重复')
-            selected[key] = row.get('outfit')
-            events[key] = row.get('changes', row.get('outfit_changes', {}))
-    else:
-        selected, events = raw['outfits'], raw.get('outfit_changes', {})
-    if not isinstance(selected, dict) or not isinstance(events, dict):
-        raise WardrobeError('衣装选择不完整或不存在：outfits与outfit_changes必须是对象')
-    required = {str(i) for i in pending}
-    if set(selected) != required:
-        raise WardrobeError('衣装选择不完整或不存在：需要且只需要场景序号' + ','.join(sorted(required)))
-    for key, oid in selected.items():
-        if not isinstance(oid, str) or oid not in allowed:
-            raise WardrobeError(f'衣装选择不完整或不存在：场景{key}的衣装不在候选中')
-    checked_events = {}
-    for key, mapping in events.items():
-        if key not in required or not isinstance(mapping, dict):
-            raise WardrobeError('衣装换装场景无效：只能修改待选场景')
-        line_ids = {line.get('id') for line in scenes[int(key)].get('lines', [])}
-        if any(lid not in line_ids for lid in mapping):
-            raise WardrobeError(f'换装包含未知台词：场景{key}只能使用本幕输入的台词id')
-        if any(not isinstance(oid, str) or oid not in allowed for oid in mapping.values()):
-            raise WardrobeError('衣装选择不完整或不存在：换装衣装不在候选中')
-        checked_events[key] = dict(mapping)
-    return dict(outfits=dict(selected), outfit_changes=checked_events)
 
 
 class Wardrobe:
@@ -70,6 +30,8 @@ class Wardrobe:
         self.entries = {}
         self.by_character = {cid: [] for cid in adapter.characters}
         self._bounds = {}
+        self._clips = {}
+        self._holds = {}
         self._pending = {}
         self._worker = None
         manifest = adapter.asset_root.parent / "spine_manifest.json"
@@ -108,7 +70,12 @@ class Wardrobe:
             return None
         if oid not in self._bounds:
             try:
-                data = json.loads((self.adapter.asset_root / "spine" / "idols" / oid / "data.json").read_text(encoding="utf-8"))["skeleton"]
+                source = json.loads((self.adapter.asset_root / "spine" / "idols" / oid / "data.json").read_text(encoding="utf-8"))
+                if isinstance(animations := source.get('animations'), dict):
+                    from visual_fields import is_hold_action
+                    self._clips[oid] = list(animations)
+                    self._holds[oid] = [name for name, clip in animations.items() if is_hold_action(name, clip)]
+                data = source["skeleton"]
                 width, height = float(data["width"]), float(data["height"])
                 if not 0 < width < 100000 or not 0 < height < 100000:
                     raise ValueError()
@@ -118,6 +85,8 @@ class Wardrobe:
         name = self.entries[oid].get("dressName", oid)
         kind = "舞台衣装" if oid.startswith("stand_costume/") else "日常衣装"
         return dict(id=oid, url=f"/api/kaibun/stand/{oid}/",
+                    animation_names=self._clips.get(oid),
+                    hold_actions=self._holds.get(oid,[]),
                     thumbnail=f"/api/kaibun/wardrobe/{oid}.png", bounds=self._bounds[oid],
                     label=f"{name} · {kind}")
 
@@ -225,88 +194,21 @@ class Wardrobe:
             for lid, mapping in changes[i].items():
                 if lid not in line_ids or not isinstance(mapping, dict) or any(not self.outfit(cid, oid) for cid, oid in mapping.items()):
                     raise WardrobeError('已保存的场内换装记录无效')
-        for cid in cast:
-            options = self.outfits(cid)
-            if not options:
-                continue  # Name/avatar staging works without proprietary stand assets.
-            existing = [i for i in range(len(scenes)) if cid in plans[i]]
-            if mode == 'fixed':
-                default = DAILY_DEFAULTS.get(cid, self.adapter.characters[cid].default_outfit)
-                chosen = next((plans[i][cid] for i in existing), None) or requested.get(cid) or (default if self.outfit(cid,default) and automatic_outfit(default) else next((o['id'] for o in options if automatic_outfit(o['id'])),None))
-                if chosen is None:
-                    continue
-                for i, plan in enumerate(plans):
-                    chosen = plan.setdefault(cid, chosen)
-                    for line in scenes[i].get('lines', []):
-                        chosen = changes[i].get(line.get('id'), {}).get(cid, chosen)
-                continue
-            if scenes and cid not in plans[0] and requested.get(cid):
-                plans[0][cid] = requested[cid]
-            pending = [i for i in range(len(scenes)) if cid not in plans[i]]
-            if not pending:
-                continue
-            previous = {}
-            latest = None
-            for i, plan in enumerate(plans):
-                if cid in plan:
-                    previous[str(i)] = latest = plan[cid]
-                    for line in scenes[i].get('lines', []):
-                        latest = changes[i].get(line.get('id'), {}).get(cid, latest)
-            context = json.dumps(dict(premise=doc.get('premise', ''), places=[s.get('place', '') for s in scenes]), ensure_ascii=False)
-            candidates = self.index.candidates(cid, context, limit=8, required=[latest, requested.get(cid)])
-            if not candidates:
-                ids = [o['id'] for o in options if automatic_outfit(o['id'])][:8]
-                await self.prepare_images(ids)
-                await self.index.annotate(ids)
-                candidates = self.index.candidates(cid, context, limit=8, required=[latest, requested.get(cid)])
-            if not candidates:
-                raise WardrobeError('衣装观察资料尚未准备，请先建立衣装索引')
-            payload = dict(character=cid, premise=doc.get('premise', ''), select_scenes=pending,
-                           default_outfit=self.adapter.characters[cid].default_outfit,
-                           previous_choices=previous, outfits=candidates,
-                           scenes=[dict(scene=i, place=s.get('place', ''), lines=[dict(id=l.get('id'), speaker=l.get('speaker'), zh=l.get('zh', '')) for l in s.get('lines', [])],
-                                        existing_outfit=plans[i].get(cid), existing_changes={lid: m[cid] for lid, m in changes[i].items() if cid in m})
-                                   for i, s in enumerate(scenes)])
-            cache_key = hashlib.sha256(json.dumps(dict(provider=provider_id(self.adapter), version=4, context=payload), ensure_ascii=False, sort_keys=True).encode()).hexdigest()
-            cache = self.directory / 'choices' / (cache_key + '.json')
-            allowed = {r['id'] for r in candidates}
-            raw = None
-            if cache.is_file():
-                try:
-                    raw = validate_outfit_plan(json.loads(cache.read_text(encoding='utf-8')), pending, scenes, allowed)
-                except (OSError, ValueError):
-                    pass  # Ignore invalid cache entries, never fail repeatedly on one cached answer.
-            if raw is None:
-                system = ('按剧情为角色选择衣装。仅使用候选id；已完成的场景保持原样。'
-                          '为select_scenes的每一幕填写开场衣装，幕序号是输入scene字段的原值，从0开始。'
-                          '只有对白明确换装时才填写outfit_changes，键为该幕输入的台词id。'
-                          '只返回JSON对象，包含outfits和outfit_changes两个对象；不包含其他角色或已完成场景。')
-                request = dict(payload, output_example=dict(outfits={str(i): candidates[0]['id'] for i in pending}, outfit_changes={str(i): {} for i in pending}))
-                for attempt in range(2):
-                    reply = await self.adapter.complete(system, json.dumps(request, ensure_ascii=False))
-                    try:
-                        raw = validate_outfit_plan(parse_object(reply), pending, scenes, allowed)
-                        break
-                    except (ValueError, KeyError, TypeError, AttributeError) as error:
-                        reason = str(error) if isinstance(error, WardrobeError) else '衣装结果不是完整有效的JSON对象'
-                        sid = doc.get('id', '')
-                        if re.fullmatch(r'[a-f0-9]{32}', sid):
-                            atomic_json(self.directory.parent / 'diagnostics' / f'{sid}-wardrobe-{cid}-{attempt + 1}.json',
-                                        dict(stage='wardrobe', character=cid, model=getattr(self.adapter, 'model', None), attempt=attempt + 1, reason=reason, response=reply))
-                        if attempt:
-                            raise WardrobeError(reason + '；自动修正后仍未通过，请继续重试或手动固定衣装') from None
-                        request = dict(request, format_repair=dict(reason=reason, previous_response=reply))
-            selected, events = raw['outfits'], raw['outfit_changes']
-            for i in pending:
-                plans[i][cid] = selected[str(i)]
-                for lid, oid in events.get(str(i), {}).items():
-                    changes[i].setdefault(lid, {})[cid] = oid
-            atomic_json(cache, raw)
-        # No partial story mutation if any character's plan is rejected.
-        for scene, plan, events in zip(scenes, plans, changes):
+        policy = StoryOutfits(self.adapter.characters, self.outfit, self.outfits, self.adapter)
+        fixed = {}
+        if mode == 'fixed':
+            fixed.update(requested)
+            for plan in plans:
+                for cid, oid in plan.items():
+                    fixed.setdefault(cid, oid)
+        previous = {}
+        for index, scene in enumerate(scenes):
+            plans[index] = await policy.scene_choices(doc, scene, cast, previous, fixed)
+            previous.update(plans[index])
+            for line in scene.get('lines', []):
+                previous.update(changes[index].get(line['id'], {}))
+        for scene, plan in zip(scenes, plans):
             scene['outfits'] = plan
-            if events:
-                scene['outfit_changes'] = events
         return plans
 
 
@@ -389,6 +291,18 @@ async def complete_with_images(adapter, system, user, images):
         if not response.is_success:
             raise WardrobeError(f"当前对话模型的衣装看图请求未完成（HTTP {response.status_code}），请确认模型支持图片后重试")
         data = response.json()
+        from support.billing import bill
+        usage=data.get('usage') or {}
+        if isinstance(usage,dict):
+            if settings.protocol=='chat-completions':
+                detail=usage.get('prompt_tokens_details') or {}
+                bill('tokens',usage.get('prompt_tokens'),usage.get('completion_tokens'),detail.get('cached_tokens') if isinstance(detail,dict) else None)
+            elif settings.protocol=='responses':
+                detail=usage.get('input_tokens_details') or {}
+                bill('tokens',usage.get('input_tokens'),usage.get('output_tokens'),detail.get('cached_tokens') if isinstance(detail,dict) else None)
+            elif settings.protocol=='anthropic':
+                total=sum(usage.get(key) or 0 for key in ('input_tokens','cache_read_input_tokens','cache_creation_input_tokens'))
+                bill('tokens',total,usage.get('output_tokens'),usage.get('cache_read_input_tokens'))
         if data.get("error"):
             raise WardrobeError("当前对话模型未接受衣装图片，请确认视觉支持后重试")
         if settings.protocol == "responses":

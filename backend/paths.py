@@ -15,8 +15,23 @@ def characters_path_from_env():
     return project_path(os.environ.get('KAIBUN_CHARACTERS_PATH') or 'characters/characters.toml')
 
 def load_environment():
-    from dotenv import load_dotenv
-    load_dotenv(ROOT / '.env')
+    from dotenv import dotenv_values
+    local = dotenv_values(ROOT / '.env')
+    values = {}
+    source = os.environ.get('KAIBUN_SOURCE_ENV') or local.get('KAIBUN_SOURCE_ENV')
+    if source:
+        original = dotenv_values(project_path(source))
+        # Read only the services used by this test copy, never the original account/database settings.
+        prefixes = ('CHAT_LLM_', 'KAIBUN_BACKGROUND_LLM_', 'FISH_AUDIO_')
+        optional = {'KAIBUN_PRODUCER_VOICE_ID', 'KAIBUN_FUYUKO_IDOL_VOICE_ID', 'KAIBUN_FFMPEG'}
+        values.update({key: value for key, value in original.items() if key.startswith(prefixes) or key in optional})
+        values['KAIBUN_PROXY_URL'] = original.get('KAIBUN_PROXY_URL') or original.get('EIDOLON_PROXY_URL') or ''
+        routes = original.get('KAIBUN_PROXY_SERVICES') or original.get('EIDOLON_PROXY_SERVICES') or ''
+        values['KAIBUN_PROXY_SERVICES'] = ','.join(name.strip() for name in routes.split(',') if name.strip() in {'all', 'chat_llm', 'tts'})
+    values.update(local)
+    for key, value in values.items():
+        if value is not None:
+            os.environ.setdefault(key, value)
 
 def runtime_connection(token=None):
     import json

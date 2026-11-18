@@ -4,7 +4,9 @@ import hashlib
 import json
 import os
 import asyncio
+import re
 from dataclasses import replace
+from functools import lru_cache
 from pathlib import Path
 
 import httpx
@@ -26,11 +28,27 @@ from outfit_policy import AUTO_EXCLUDED, DAILY_DEFAULTS
 from voice_errors import VoiceError
 
 
+def parenthesized_dialogue(text):
+    """A complete Japanese dialogue sentence wrapped in parentheses is still speech.
+
+    Bare cues such as （笑う） or （小声で） continue to be filtered. Only the
+    synthesis input is unwrapped; the saved script and its kind are unchanged.
+    """
+    match=re.fullmatch(r'(?:\(([^()（）]*)\)|（([^()（）]*)）)',text.strip())
+    if not match:return None
+    inner=next(group for group in match.groups() if group is not None).strip()
+    if re.search(r'[ぁ-ゖァ-ヺ]',inner) and re.search(r'[。！？!?、…]',inner):return inner
+    return None
+
+
 def story_voice_text(line, model):
     text = line["ja"]
     if line.get("kind") == "thought":
         # Story thoughts put meaningful words inside parentheses, unlike chat stage directions.
         text = text.translate(str.maketrans("", "", "()（）"))
+    else:
+        unwrapped=parenthesized_dialogue(text)
+        if unwrapped is not None:text=unwrapped
     return spoken_by(voiced(f"[{line['emotion']}] {text}"), model)
 
 
@@ -40,25 +58,53 @@ class BackgroundSelector:
     def __init__(self, proxy):
         settings = LLMSettings._from_env("KAIBUN_BACKGROUND", fallback="CHAT")
         self.settings = replace(settings, model=os.environ.get("KAIBUN_BACKGROUND_LLM_MODEL") or settings.model,
-                                max_tokens=settings.max_tokens or 4096,
-                                reasoning_effort=settings.reasoning_effort or "low")
+                                max_tokens=settings.max_tokens,
+                                reasoning_effort=settings.reasoning_effort)
         self.model = self.settings.model
-        self.client = open_client(proxy.proxy_for("chat_llm"), httpx.Timeout(180, connect=15))
+        self.request_timeout=max(1,float(os.environ.get('KAIBUN_BACKGROUND_REQUEST_TIMEOUT_SECONDS') or 180))
+        from urllib.parse import urlsplit
+        from selector_limits import SelectorLimits
+        school=urlsplit(settings.base_url).hostname=='models.sjtu.edu.cn'
+        self.limits=SelectorLimits(os.environ.get('KAIBUN_BACKGROUND_REQUESTS_PER_MINUTE') or (10 if school else 0),
+                                   os.environ.get('KAIBUN_BACKGROUND_TOKENS_PER_MINUTE') or (300000 if school else 0))
+        route = proxy.proxy_for("chat_llm")
+        # Absent preserves the shared proxy; an explicitly empty override means
+        # direct access to a school/local endpoint, without changing the writer.
+        if 'KAIBUN_BACKGROUND_PROXY_URL' in os.environ:
+            route = os.environ['KAIBUN_BACKGROUND_PROXY_URL'].strip() or None
+        self.client = open_client(route, httpx.Timeout(180, connect=15))
         self.llm = open_llm(self.settings, self.client)
 
     async def complete(self, system, user):
-        chunks = []
-        stream = self.llm.stream([ChatMessage("system", system), ChatMessage("user", user)])
-        try:
-            async for item in stream:
-                if isinstance(item, str):
-                    chunks.append(item)
-        finally:
-            await stream.aclose()
-        return "".join(chunks)
+        from selector_limits import estimate_budget
+        from support.billing import Billing,billing
+        async with self.limits.reserve(estimate_budget(self.settings,system,user)) as reservation:
+            chunks = []
+            used=Billing()
+            stream = self.llm.stream([ChatMessage("system", system), ChatMessage("user", user)])
+            try:
+                async with asyncio.timeout(self.request_timeout):
+                    with billing(used):
+                        async for item in stream:
+                            if isinstance(item, str):
+                                chunks.append(item)
+            finally:
+                await stream.aclose()
+                if used.input is not None or used.output is not None:
+                    self.limits.settle(reservation,(used.input or 0)+(used.output or 0))
+            return "".join(chunks)
 
     async def complete_with_images(self, system, user, images):
-        return await complete_with_images(self, system, user, images)
+        from selector_limits import estimate_budget
+        from support.billing import Billing,billing
+        async with self.limits.reserve(estimate_budget(self.settings,system,user,images)) as reservation:
+            used=Billing()
+            try:
+                with billing(used):
+                    return await complete_with_images(self, system, user, images)
+            finally:
+                if used.input is not None or used.output is not None:
+                    self.limits.settle(reservation,(used.input or 0)+(used.output or 0))
 
     async def close(self):
         await self.llm.aclose()
@@ -113,6 +159,12 @@ class ProjectAdapter:
         self.background_selector = BackgroundSelector(self.proxy)
         self.wardrobe = Wardrobe(WardrobeAdapter(self, self.background_selector), data_root() / 'wardrobe')
         self.backgrounds = Backgrounds(self.background_selector, data_root() / 'backgrounds')
+        from body_director import BodyDirector
+        self.body_director = BodyDirector(self, data_root() / 'body_direction')
+        from scene_production import SceneProduction
+        self.scene_production = SceneProduction(self,data_root()/'scene_production')
+        from preset_director import PresetDirector
+        self.preset_director = PresetDirector(self)
 
     def has_voice(self, cid):
         character = self.characters.get(cid)
@@ -122,14 +174,18 @@ class ProjectAdapter:
 
     async def complete(self, system, user):
         chunks = []
+        async for item in self.stream_complete(system, user):
+            chunks.append(item)
+        return "".join(chunks)
+
+    async def stream_complete(self, system, user):
         stream = self.llm.stream([ChatMessage("system", system), ChatMessage("user", user)])
         try:
             async for item in stream:
                 if isinstance(item, str):
-                    chunks.append(item)
+                    yield item
         finally:
             await stream.aclose()
-        return "".join(chunks)
 
     async def complete_with_images(self, system, user, images):
         return await complete_with_images(self, system, user, images)
@@ -152,16 +208,22 @@ class ProjectAdapter:
     async def prepare_backgrounds(self, doc):
         return await self.backgrounds.prepare(doc)
 
+    async def prepare_body_actions(self, doc, checkpoint=None):
+        return await self.body_director.prepare(doc,checkpoint=checkpoint)
+
+    async def prepare_scene_production(self, doc, checkpoint=None, progress=None):
+        return await self.scene_production.prepare(doc,checkpoint=checkpoint,progress=progress)
+
     def catalog(self):
         result = []
         for c in self.characters.values():
             outfit = c.default_outfit
             stand = None
-            if outfit and (self.asset_root / "spine" / "idols" / outfit / "data.json").is_file():
+            if self.wardrobe.outfit(c.id, outfit):
                 stand = {"id": outfit, "url": f"/api/kaibun/stand/{outfit}/"}
             result.append(dict(**identity(c),
                                retired_default_outfits=[oid for oid in AUTO_EXCLUDED if self.wardrobe.outfit(c.id, oid)],
-                               avatar_url=f"/api/kaibun/characters/{c.id}/avatar",
+                               avatar_url=f"/api/kaibun/characters/{c.id}/avatar" if c.avatar and Path(c.avatar).is_file() else None,
                                background_url=f"/api/kaibun/characters/{c.id}/background" if c.background else None,
                                stand=stand, stand_bounds=self.stand_bounds.get(c.id)))
         return result
@@ -173,11 +235,22 @@ class ProjectAdapter:
             voice = os.environ.get("KAIBUN_FUYUKO_IDOL_VOICE_ID") or voice
         if line['speaker'] == 'nichika' and line.get('nichika_voice_style') == 'idol':
             voice = os.environ.get('KAIBUN_NICHIKA_IDOL_VOICE_ID') or 'b3757a5a71ba4078be1e25b446190975'
-        payload = "\n".join((line["ja"], line["emotion"], voice, self.tts_model))
-        if line.get("kind") == "thought":
+        return self._voice_signature(line['ja'], line['emotion'], voice, self.tts_model, line.get('kind') == 'thought')
+
+    @lru_cache(maxsize=8192)
+    def _voice_signature(self, ja, emotion, voice, model, thought):
+        # Configuration/readings/character names belong to this adapter instance.
+        # Content, effective voice and model stay in the key, so edits cannot
+        # reuse an earlier line's audio signature.
+        line = dict(ja=ja, emotion=emotion, kind='thought' if thought else 'dialogue')
+        payload = "\n".join((ja, emotion, voice, model))
+        if thought:
             payload += "\nstory-thought-v2"
-        spoken = speech_names(story_voice_text(line, self.tts_model), self.characters)
-        if spoken != story_voice_text(line, self.tts_model):
+        elif parenthesized_dialogue(ja) is not None:
+            payload += "\nparenthesized-dialogue-v1"
+        original = story_voice_text(line, model)
+        spoken = speech_names(original, self.characters)
+        if spoken != original:
             payload += "\nname-kana-v1\n" + spoken
         relevant = used_in(spoken, getattr(self, 'readings', ()))
         if relevant:

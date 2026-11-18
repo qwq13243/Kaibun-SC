@@ -1,6 +1,7 @@
 """Sentence-local visual cues. These never create dialogue or change voice identity."""
 from copy import deepcopy
 import re
+from visual_fields import actor_state, expression_valid, body_valid, mouth_valid
 
 MOODS = {'calm', 'happy', 'shy', 'surprised', 'sad', 'angry', 'thinking'}
 
@@ -18,13 +19,17 @@ def normalize_segments(segments, line, cast):
             raise ValueError('人物演出设置无效')
         clean = {}
         for cid, state in states.items():
-            if cid not in cast or not isinstance(state, dict) or state.get('emotion', 'calm') not in MOODS or state.get('body_mood') not in MOODS | {None, ''}:
+            if cid not in cast:
                 raise ValueError('人物演出设置无效')
-            clean[cid] = {key: (value or None) if key == 'body_mood' else value for key, value in state.items() if key in ('emotion', 'body_mood')}
+            clean[cid] = actor_state({k:(v or None) if k=='body_mood' else v for k,v in state.items()})
         emotion = seg.get('emotion', line.get('emotion', 'calm'))
         if emotion not in MOODS or seg.get('body_mood') not in MOODS | {None, ''}:
             raise ValueError('区间表情或动作无效')
         result.append(dict(ja=seg['ja'], zh=seg['zh'], emotion=emotion, body_mood=seg.get('body_mood') or None, actor_states=clean, start=offset))
+        for field,check in (('expression',expression_valid),('body_action',body_valid),('mouth_action',mouth_valid),('rest_mouth_action',mouth_valid)):
+            if field in seg:
+                if not check(seg[field]): raise ValueError('区间表情或动作无效')
+                result[-1][field]=seg[field]
         offset += len(seg['ja'])
     if ''.join(s['ja'] for s in result) != line['ja'] or ''.join(s['zh'] for s in result) != line['zh']:
         raise ValueError('演出区间必须完整对应本句台词，不能重复或遗漏')

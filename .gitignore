@@ -10,7 +10,9 @@ assets/
 /spine_manifest.json
 corpus/
 characters/avatars/
+characters/avatars-scsp/
 characters/backgrounds/
+characters/signatures/
 frontend/public/vendor/spine-3.6/spine-webgl.js
 # Local dependencies and build products
 node_modules/
@@ -24,3 +26,6 @@ next-env.d.ts
 .pytest_cache/
 .DS_Store
 Thumbs.db
+
+# Machine-specific test notes
+/LOCAL_TEST_SETUP.md

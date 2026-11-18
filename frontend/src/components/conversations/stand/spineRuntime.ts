@@ -84,7 +84,7 @@ export type AssetManager = {
 export type TextureAtlas = { readonly __brand: "TextureAtlas" };
 type AttachmentLoader = { readonly __brand: "AttachmentLoader" };
 
-export type SkeletonJson = { readSkeletonData(json: string): SkeletonData };
+export type SkeletonJson = { readSkeletonData(json: string|object): SkeletonData };
 
 export type SkeletonData = {
   animations: Animation[];
@@ -106,9 +106,12 @@ export type ClippingAttachment = Attachment & {
   endSlot: SlotData | null;
 };
 
-export type SlotData = { index: number };
+export type SlotData = { index: number; name?:string };
 
 export type Slot = {
+  bone?: {data:{name:string};parent?:Slot['bone']|null};
+  color: {a:number};
+  attachmentVertices?:number[];
   data: SlotData;
   getAttachment(): Attachment | null;
   setAttachment(attachment: Attachment | null): void;

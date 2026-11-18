@@ -1,6 +1,6 @@
 [project]
 name = "kaibun"
-version = "0.2.0"
+version = "0.3.0"
 description = "Local bilingual dialogue story authoring and playback"
 requires-python = ">=3.11"
 license = "AGPL-3.0-or-later"

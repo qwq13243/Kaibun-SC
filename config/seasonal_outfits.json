@@ -1,0 +1,208 @@
+{
+  "version": 1,
+  "default_outfits": {
+    "mano": {
+      "spring": "stand/1040010010",
+      "summer": "stand/1030010010",
+      "autumn": "stand/1030010020",
+      "winter": "stand/1030010040",
+      "special": "stand/1930010010"
+    },
+    "hiori": {
+      "special": "stand/1930020010",
+      "spring": "stand/1040020010",
+      "summer": "stand/1030020010",
+      "autumn": "stand/1030020050",
+      "winter": "stand/1040020020"
+    },
+    "meguru": {
+      "spring": "stand/1040030010",
+      "summer": "stand/1030030010",
+      "autumn": "stand/1030030020",
+      "winter": "stand/1030030050",
+      "special": "stand/1040030140"
+    },
+    "kogane": {
+      "spring": "stand/1030040010",
+      "summer": "stand/1040040010",
+      "autumn": "stand/1040040030",
+      "winter": "stand/1040040040",
+      "special": "stand/1930040010"
+    },
+    "mamimi": {
+      "special": "stand/1930050010",
+      "spring": "stand/1030050010",
+      "summer": "stand/1030050010",
+      "winter": "stand/1040050040",
+      "autumn": "stand/1030050050"
+    },
+    "sakuya": {
+      "spring": "stand/1030060010",
+      "autumn": "stand/1040060060",
+      "winter": "stand/1040060070",
+      "summer": "stand/1930060010",
+      "special": "stand/1940060010"
+    },
+    "yuika": {
+      "spring": "stand/1040070060",
+      "autumn": "stand/1040070010",
+      "summer": "stand/1030070010",
+      "special": "stand/1930070010",
+      "winter": "stand/1040070130"
+    },
+    "kiriko": {
+      "summer": "stand/1030080010",
+      "spring": "stand/1030080030",
+      "autumn": "stand/1040080020",
+      "winter": "stand/1040080060",
+      "special": "stand/1930080010"
+    },
+    "toru": {
+      "autumn": "stand/1040200060",
+      "winter": "stand/1030200010",
+      "spring": "stand/1040200010",
+      "summer": "stand/1040200020",
+      "special": "stand/1930200010"
+    },
+    "madoka": {
+      "special": "stand/1930210010",
+      "autumn": "stand/1030210020",
+      "spring": "stand/1040210010",
+      "summer": "stand/1040210030",
+      "winter": "stand/1040210060"
+    },
+    "koito": {
+      "spring": "stand/1030220010",
+      "summer": "stand/1040220010",
+      "winter": "stand/1040220080",
+      "autumn": "stand/1040220100",
+      "special": "stand/1930220010"
+    },
+    "hinana": {
+      "spring": "stand/1040230060",
+      "summer": "stand/1040230010",
+      "autumn": "stand/1030230020",
+      "winter": "stand/1040230050",
+      "special": "stand/1930230010"
+    },
+    "nichika": {
+      "special": "stand/1930240010",
+      "winter": "stand/1040240100",
+      "summer": "stand/1040240010",
+      "spring": "stand/1040240020",
+      "autumn": "stand/1040240110"
+    },
+    "mikoto": {
+      "special": "stand/1930250010",
+      "autumn": "stand/1030250010",
+      "winter": "stand/1040250070",
+      "spring": "stand/1040250030",
+      "summer": "stand/1930250010"
+    },
+    "asahi": {
+      "summer": "stand/1030170020",
+      "winter": "stand/1040170050",
+      "autumn": "stand/1040170070",
+      "spring": "stand/1030170010",
+      "special": "stand/1930170010"
+    },
+    "fuyuko": {
+      "winter": "stand/1040180080",
+      "special": "stand/1930180010",
+      "autumn": "stand/1030180040",
+      "spring": "stand/1030180010",
+      "summer": "stand/1040180010"
+    },
+    "mei": {
+      "special": "stand/1930190010",
+      "spring": "stand/1030190010",
+      "summer": "stand/1030190040",
+      "winter": "stand/1040190110",
+      "autumn": "stand/1040190070"
+    },
+    "kaho": {
+      "spring": "stand/1030090010",
+      "summer": "stand/1040090010",
+      "autumn": "stand/1040090060",
+      "winter": "stand/1040090080",
+      "special": "stand/1930090010"
+    },
+    "chiyoko": {
+      "special": "stand/1930100010",
+      "autumn": "stand/1030100040",
+      "winter": "stand/1040100010",
+      "summer": "stand/1030100010",
+      "spring": "stand/1040100050"
+    },
+    "juri": {
+      "spring": "stand/1030110010",
+      "summer": "stand/1040110030",
+      "autumn": "stand/1030110020",
+      "winter": "stand/1030110030",
+      "special": "stand/1930110010"
+    },
+    "rinze": {
+      "spring": "stand/1030120010",
+      "summer": "stand/1030120030",
+      "autumn": "stand/1030120060",
+      "winter": "stand/1040120080",
+      "special": "stand/1930120010"
+    },
+    "natsuha": {
+      "spring": "stand/1030130010",
+      "summer": "stand/1030130030",
+      "autumn": "stand/1040130130",
+      "winter": "stand/1040130070",
+      "special": "stand/1930130010"
+    },
+    "amana": {
+      "special": "stand/1930140010",
+      "spring": "stand/1030140040",
+      "summer": "stand/1040140080",
+      "winter": "stand/1040140060",
+      "autumn": "stand/1040140020"
+    },
+    "tenka": {
+      "spring": "stand/1030150010",
+      "summer": "stand/1030150050",
+      "winter": "stand/1030150030",
+      "autumn": "stand/1030150040",
+      "special": "stand/1930150010"
+    },
+    "chiyuki": {
+      "spring": "stand/1030160010",
+      "summer": "stand/1030160020",
+      "autumn": "stand/1040160110",
+      "winter": "stand/1030160030",
+      "special": "stand/1930160010"
+    },
+    "luca": {
+      "spring": "stand/1030260010",
+      "summer": "stand/1040260070",
+      "autumn": "stand/1040260060",
+      "winter": "stand/1040260030",
+      "special": "stand/1930260010"
+    },
+    "hana": {
+      "special": "stand/1930270010",
+      "spring": "stand/1030270010",
+      "autumn": "stand/1040270010",
+      "winter": "stand/1040270030",
+      "summer": "stand/1040270060"
+    },
+    "haruki": {
+      "spring": "stand/1040280010",
+      "special": "stand/1930280010",
+      "summer": "stand/1040280050",
+      "autumn": "stand/1040280020",
+      "winter": "stand/1040280040"
+    },
+    "hazuki": {
+      "special": "stand/2040910010",
+      "spring": "stand/2040910010",
+      "autumn": "stand/2040910010",
+      "summer": "stand/2040910010",
+      "winter": "stand/2040910010"
+    }
+  }
+}

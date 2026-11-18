@@ -1,4 +1,4 @@
-"""Scene-by-scene fiction generation with checkpoints and compact continuity."""
+"""Durable story writing with full context and concurrent production."""
 
 import asyncio
 import json
@@ -6,8 +6,12 @@ import logging
 import re
 from pathlib import Path
 
-from production import Production, ProductionError
+from production import Production, ProductionError, ProductionPipeline
+from script_context import full_script
+from production_state import clear_production_error,normalize_recovered
 from character_names import identity, name_reference, NAME_RULES
+from support.llm import RateLimitError
+from writer_retry import wait_for_writer_retry
 
 EMOTIONS = {"calm", "happy", "shy", "surprised", "sad", "angry", "thinking"}
 def creative_guidance(stage="script"):
@@ -44,6 +48,15 @@ LENGTHS = {
 class StoryFormatError(ValueError):
     """A locally written, safe explanation of an invalid story response."""
 
+    def __init__(self, reason, *, field=None, scene_number=None, line_number=None):
+        self.issue = dict(kind='format', reason=reason)
+        self.issue.update({key: value for key, value in dict(field=field, scene_number=scene_number,
+                                                             line_number=line_number).items() if value is not None})
+        where = f'第{scene_number}幕' if scene_number is not None else ''
+        if line_number is not None:
+            where += f'第{line_number}句'
+        super().__init__((where + '：' if where else '') + reason)
+
 
 def story_character_sheet(sheet):
     """Keep character material while omitting instructions for live private chats."""
@@ -65,107 +78,153 @@ def json_object(text):
     return value
 
 
-def validate_outline(raw, known, requested, length):
+def validate_outline(raw, known, requested, length, *, previous=None):
     if isinstance(raw, dict) and "scenes" not in raw and isinstance(raw.get("outline"), dict):
         raw = raw["outline"]
     cast = raw.get("cast", requested)
-    if not isinstance(cast, list) or not cast or any(not isinstance(c, str) or c not in known for c in cast):
+    if not isinstance(cast, list) or any(not isinstance(c, str) or c not in known for c in cast):
         raise StoryFormatError("大纲出场人物需为资料中的角色id")
-    if requested and not set(requested).issubset(cast):
-        raise StoryFormatError("大纲遗漏了指定人物")
+    cast = list(dict.fromkeys(cast))
     scenes = raw.get("scenes")
     if not isinstance(scenes, list) or not 1 <= len(scenes) <= 64:
         raise StoryFormatError("大纲需要包含1至64个场景")
-    clean_scenes = []
-    for scene in scenes:
-        if not isinstance(scene, dict) or not all(isinstance(scene.get(k), str) and scene[k].strip() for k in ("place", "direction")):
-            raise StoryFormatError("大纲场景的place与direction需要非空文本")
-        clean_scenes.append(dict(place=scene["place"].strip()[:160], direction=scene["direction"].strip()[:2400], transition=scene.get("transition") if scene.get("transition") in ("cut", "pause", "fade") else "cut"))
     guests = raw.get("guests", [])
     if not isinstance(guests, list):
         raise StoryFormatError("大纲guests需要数组，未用配角时填写空数组")
+    prior_guests = {guest['id']: guest['name'] for guest in (previous or {}).get('guests', [])}
     clean_guests = []
-    for guest in guests[:3]:
-        if isinstance(guest, dict) and isinstance(guest.get("id"), str) and guest["id"].isascii() and guest["id"].replace("_", "").isalnum() and guest["id"] not in {*known, "producer", "narrator"} and isinstance(guest.get("name"), str):
-            clean_guests.append({"id": guest["id"][:30], "name": guest["name"][:40]})
-    return dict(cast=list(dict.fromkeys(cast)),
+    seen_guests = set()
+    for number, guest in enumerate(guests, 1):
+        guest_id = guest.get('id') if isinstance(guest, dict) else None
+        name = guest.get('name') if isinstance(guest, dict) else None
+        if not isinstance(guest_id, str) or not re.fullmatch(r'[A-Za-z0-9_]{1,30}', guest_id) or not guest_id.strip('_'):
+            raise StoryFormatError(f'第{number}位配角的id需为1至30个字母、数字或下划线', field='guests')
+        if guest_id in known or guest_id in {'producer', 'narrator'} or guest_id in seen_guests:
+            raise StoryFormatError(f'第{number}位配角的id「{guest_id}」重复或与已有角色冲突', field='guests')
+        if not isinstance(name, str) or not name.strip():
+            raise StoryFormatError(f'第{number}位配角缺少姓名', field='guests')
+        name = name.strip()[:40]
+        if guest_id in prior_guests and name != prior_guests[guest_id]:
+            raise StoryFormatError(f'第{number}位配角的id「{guest_id}」已用于前文的另一位配角', field='guests')
+        seen_guests.add(guest_id)
+        if len(seen_guests - prior_guests.keys()) > 3:
+            raise StoryFormatError(f'第{number}位配角超过本次最多新增3位的上限', field='guests')
+        clean_guests.append(dict(id=guest_id, name=name))
+    clean_scenes = []
+    for number, scene in enumerate(scenes, 1):
+        if not isinstance(scene, dict) or not all(isinstance(scene.get(k), str) and scene[k].strip() for k in ('place', 'direction')):
+            raise StoryFormatError('大纲场景的place与direction需要非空文本', scene_number=number)
+        people = scene.get('speaking_roles')
+        if not isinstance(people, list) or not people or any(not isinstance(cid, str) for cid in people):
+            raise StoryFormatError('speaking_roles需列出本幕实际发言的角色id', field='speaking_roles', scene_number=number)
+        for cid in dict.fromkeys(people):
+            if cid in known:
+                if cid not in cast:
+                    cast.append(cid)
+            elif cid != 'producer' and cid not in seen_guests and cid not in prior_guests:
+                label = f'「{cid}」' if re.fullmatch(r'[A-Za-z0-9_]{1,30}', cid) else ''
+                raise StoryFormatError(f'speaking_roles含未登记的发言人{label}，请使用正式角色id或在guests定义', field='speaking_roles', scene_number=number)
+        clean_scenes.append(dict(place=scene['place'].strip()[:160], direction=scene['direction'].strip()[:2400],
+                                 transition=scene.get('transition') if scene.get('transition') in ('cut', 'pause', 'fade') else 'cut',
+                                 speaking_roles=list(dict.fromkeys(people))))
+    if not cast or not set(requested).issubset(cast):
+        raise StoryFormatError('大纲至少需要一位正式角色，并包含所有指定人物', field='cast')
+    return dict(cast=cast,
                 opening=raw.get("opening", "").strip()[:500] if isinstance(raw.get("opening", ""), str) else "",
                 guests=clean_guests, direction=str(raw.get("direction", ""))[:1800], scenes=clean_scenes,
                 length=length)
 
 
-def validate_scene(raw, outline, index):
-    allowed = {*outline["cast"], "producer", *(g["id"] for g in outline["guests"])}
+def validate_scene(raw, outline, index, *, first_line_number=1):
+    cast = set(outline['cast'])
+    allowed = {*cast, 'producer', *(guest['id'] for guest in outline['guests'])}
     lines = raw.get("lines")
     if not isinstance(lines, list) or not lines or len(lines) > 100:
         raise StoryFormatError("场景需要包含1至100句对白")
     clean = []
     for i, line in enumerate(lines):
-        if not isinstance(line, dict) or not isinstance(line.get("speaker"), str) or line.get("speaker") not in allowed or not isinstance(line.get("zh"), str) or not line["zh"].strip():
-            raise StoryFormatError("场景speaker需为出场角色id、producer或已定义配角id，zh需为非空文本")
+        def invalid(field, reason):
+            return StoryFormatError(reason, field=field, scene_number=index + 1, line_number=first_line_number + i)
+        if not isinstance(line, dict):
+            raise invalid('line', '台词需为对象')
+        speaker = line.get('speaker')
+        if not isinstance(speaker, str) or speaker not in allowed:
+            label = f'「{speaker}」' if isinstance(speaker, str) and re.fullmatch(r'[A-Za-z0-9_]{1,30}', speaker) else ''
+            raise invalid('speaker', f'发言人{label}未登记，speaker需为本篇出场角色、producer或已定义配角的id')
+        if not isinstance(line.get('zh'), str) or not line['zh'].strip():
+            raise invalid('zh', '角色对白缺少中文字幕zh')
         ja = line.get("ja", "")
         if not isinstance(ja, str) or not ja.strip():
-            raise StoryFormatError("角色对白缺少日语ja")
+            raise invalid('ja', '角色对白缺少日语ja')
         if len(ja) > 1200 or len(line["zh"]) > 1600:
-            raise StoryFormatError("单句台词过长")
+            raise invalid('ja' if len(ja) > 1200 else 'zh', '单句台词过长')
         emotion = line.get("emotion")
         direction = dict(id=f"{index}-{i}", speaker=line["speaker"], ja=ja.strip(), zh=line["zh"].strip(),
                          emotion=emotion if isinstance(emotion, str) and emotion in EMOTIONS else "calm")
         kind = line.get("kind", "dialogue")
         if kind not in ("dialogue", "thought"):
-            raise StoryFormatError("kind需要填写dialogue对白或thought心声")
+            raise invalid('kind', 'kind需要填写dialogue对白或thought心声')
         direction["kind"] = kind
         if line["speaker"] == "fuyuko" and "voice_style" in line:
             if line["voice_style"] not in ("natural", "idol"):
-                raise StoryFormatError("冬优子声线需要填写natural或idol")
+                raise invalid('voice_style', '冬优子声线需要填写natural或idol')
             direction["voice_style"] = line["voice_style"]
         if "speakers" in line:
             speakers = line["speakers"]
-            if not isinstance(speakers, list) or not 2 <= len(speakers) <= 7 or any(not isinstance(cid, str) or cid not in outline["cast"] for cid in speakers):
-                raise StoryFormatError("异口同声需提供2至7位出场角色")
-            direction["speakers"] = list(dict.fromkeys(speakers))
-        if "onstage" in line:
-            onstage = line["onstage"]
-            if not isinstance(onstage, list) or any(not isinstance(cid, str) or cid not in outline["cast"] for cid in onstage):
-                raise StoryFormatError("onstage需要由本篇偶像id组成的数组")
-            direction["onstage"] = list(dict.fromkeys(onstage))
-        if "focus" in line:
-            focus = line["focus"]
-            if not isinstance(focus, list) or len(focus) > 7 or any(not isinstance(cid, str) or cid not in outline["cast"] for cid in focus):
-                raise StoryFormatError("focus需要包含至多7个当前交流人物的偶像id")
-            direction["focus"] = list(dict.fromkeys(focus))
+            if not isinstance(speakers, list) or not speakers or any(not isinstance(cid, str) or cid not in cast for cid in speakers):
+                raise invalid('speakers', '异口同声只能填写本篇出场角色id')
+            speakers = list(dict.fromkeys(speakers))
+            if len(speakers) > 7 or speaker not in speakers:
+                raise invalid('speakers', '异口同声去重后最多7人，且必须包含主发言人')
+            if len(speakers) > 1:
+                direction['speakers'] = speakers
+        for field in ('onstage', 'focus'):
+            people = line.get(field)
+            if isinstance(people, list):
+                visible = list(dict.fromkeys(cid for cid in people if isinstance(cid, str) and cid in cast))
+                direction[field] = visible[:7] if field == 'focus' else visible
         if 'actor_states' in line:
             states = line['actor_states']
             if not isinstance(states, dict):
-                raise StoryFormatError('actor_states需要按人物id保存表情与动作')
+                raise invalid('actor_states', 'actor_states需要按人物id保存表情与动作')
             checked = {}
             for cid, state in states.items():
-                if cid not in outline['cast'] or not isinstance(state, dict):
-                    raise StoryFormatError('actor_states包含未知人物或无效状态')
-                if any(key not in ('emotion', 'body_mood') or (value not in EMOTIONS and not (key == 'body_mood' and value is None)) for key, value in state.items()):
-                    raise StoryFormatError('人物表情或动作无效')
-                checked[cid] = dict(state)
+                if cid not in cast or not isinstance(state, dict):
+                    continue
+                # Raw visual controls belong to manual editing/production, not the writer.
+                state={key:value for key,value in state.items() if key not in ('expression','body_action','preset_id','mouth_action','rest_mouth_action')}
+                if 'body_mood' in state and not valid_body_mood(state['body_mood']):
+                    state.pop('body_mood')
+                for key,value in state.items():
+                    if key not in ('emotion','body_mood') or not (isinstance(value,str) and value in EMOTIONS or key=='body_mood' and value is None):
+                        raise invalid(f'actor_states.{cid}.{key}', f'模型返回的人物情绪或动作分类无效（{cid}.{key}），需使用七类情绪')
+                checked[cid]=state
             direction['actor_states'] = checked
         if 'listener_state_persist' in line:
             if not isinstance(line['listener_state_persist'], bool):
-                raise StoryFormatError('listener_state_persist需要布尔值')
+                raise invalid('listener_state_persist', 'listener_state_persist需要布尔值')
             direction['listener_state_persist'] = line['listener_state_persist']
-        if 'body_mood' in line:
-            if line['body_mood'] is not None and line['body_mood'] not in EMOTIONS:
-                raise StoryFormatError('身体动作无效')
+        if 'body_mood' in line and valid_body_mood(line['body_mood']):
             direction['body_mood'] = line['body_mood']
         clean.append(direction)
     memory = raw.get("memory")
     if not isinstance(memory, str) or not memory.strip():
-        raise StoryFormatError("场景缺少非空文本memory连续性记录")
+        raise StoryFormatError('场景缺少非空文本memory连续性记录', field='memory', scene_number=index + 1)
     return dict(index=index, title=f"第{index + 1}幕", place=outline["scenes"][index]["place"],
                 lines=clean, memory=memory.strip()[:2800], transition=outline["scenes"][index].get("transition", "cut"))
+
+
+def valid_body_mood(value):
+    return value is None or isinstance(value, str) and value in EMOTIONS
 
 
 class Author:
     def __init__(self, store, adapter):
         self.store, self.adapter = store, adapter
         self.tasks = {}
+        self.pipelines = {}
+        self.drains = {}
+        self.pausing = set()
         self.gate = asyncio.Semaphore(1)
         self.production = Production(store, adapter)
 
@@ -176,19 +235,90 @@ class Author:
         self.tasks[id] = task
         task.add_done_callback(lambda _: self.tasks.pop(id, None))
 
-    async def stop(self, id):
+    def busy(self, id):
+        return id in self.tasks or id in self.pipelines
+
+    def retry_production(self,id,scope='staging'):
+        doc=self.store.get(id)
+        if not doc or not doc.get('scenes'):
+            raise ValueError('至少保存一幕后才能准备演出')
+        if doc.get('revision_proposal') or (doc.get('revision_progress') or {}).get('status')=='working':
+            raise ValueError('请先处理当前修改预览')
+        pipeline=self.pipelines.get(id)
+        if pipeline and not pipeline.closed:
+            pipeline.retry(scope)
+            return pipeline.doc
+        if id in self.tasks or id in self.drains:
+            raise ValueError('当前配音或调整任务正在收尾，请稍后重试')
+        clear_production_error(doc)
+        complete=bool(doc.get('outline') and len(doc['scenes'])>=len(doc['outline']['scenes']))
+        if complete:doc.update(status='preparing',phase='正在重试未完成的制作')
+        else:doc.update(status='interrupted',phase='写作保持暂停，正在重试已保存场景的制作')
+        pipeline=ProductionPipeline(self.production,doc,voices_enabled=scope in ('voices','all'),staging_enabled=scope in ('staging','all'))
+        self.pipelines[id]=pipeline
+        drain=asyncio.create_task(self.drain_paused(id,pipeline))
+        self.drains[id]=drain
+        drain.add_done_callback(lambda _: self.drains.pop(id,None) if self.drains.get(id) is drain else None)
+        return doc
+
+    async def stop(self, id, *, production=False):
+        if not production:
+            self.pausing.add(id)
         task = self.tasks.get(id)
-        if task:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-        doc = self.store.get(id)
+        try:
+            if task:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        finally:
+            self.pausing.discard(id)
+        pipeline = self.pipelines.get(id)
+        if production:
+            drain = self.drains.pop(id, None)
+            if drain:
+                drain.cancel()
+                await asyncio.gather(drain, return_exceptions=True)
+            if pipeline:
+                self.pipelines.pop(id, None)
+                await pipeline.close()
+        doc = pipeline.doc if pipeline else self.store.get(id)
         if doc and doc["status"] != "ready":
-            doc.update(status="interrupted", phase="已暂停，可以继续")
+            doc.update(status="interrupted", phase="写作已暂停，可以继续")
             self.store.save(doc)
+        if pipeline and not production:
+            pipeline.checkpoint()
+            if id not in self.drains:
+                drain = asyncio.create_task(self.drain_paused(id, pipeline))
+                self.drains[id] = drain
+                drain.add_done_callback(lambda _: self.drains.pop(id, None) if self.drains.get(id) is drain else None)
+
+    async def drain_paused(self, id, pipeline):
+        await pipeline.wait_idle()
+        if id in self.tasks or self.pipelines.get(id) is not pipeline:
+            return
+        # Keep ownership through cleanup so edits cannot race the last save.
+        doc = pipeline.doc
+        pending_voice=len(pipeline.ready)<pipeline.total
+        pending_stage=pipeline.staged_count<len(doc['scenes']) or bool(pipeline.staging_error)
+        if len(doc['scenes']) == len(doc['outline']['scenes']):
+            if pending_voice or pending_stage:
+                doc.update(status='failed', phase='剧本已完成，语音与演出待补齐',
+                           error='部分素材未完成，继续会补齐缺失部分', failure_stage='production')
+            else:
+                doc.update(status='ready', phase='故事写好了', error=None, production_version=1)
+                doc.pop('failure_stage',None)
+                normalize_recovered(doc)
+            self.store.save(doc)
+        else:
+            doc.update(status='interrupted',phase='写作已暂停，已保存场景的制作完成' if not pending_voice and not pending_stage else '写作已暂停，部分制作仍待处理')
+            normalize_recovered(doc)
+            self.store.save(doc)
+        await pipeline.close()
+        if self.pipelines.get(id) is pipeline:
+            self.pipelines.pop(id, None)
 
     def extend(self, id, instruction):
         doc = self.store.get(id)
-        if not doc or id in self.tasks:
+        if not doc or self.busy(id):
             raise ValueError("请先停止当前创作")
         if not doc["scenes"]:
             raise ValueError("写完一幕后可以续写")
@@ -199,8 +329,17 @@ class Author:
     async def request(self, system, user, *, validate, doc, stage):
         last = None
         correction = ""
+        rate_retries = 0
         for attempt in range(2):
-            reply = await self.adapter.complete(system, user + correction)
+            while True:
+                try:
+                    reply = await self.adapter.complete(system, user + correction)
+                    break
+                except RateLimitError as error:
+                    await wait_for_writer_retry(self.store, doc, error, rate_retries)
+                    rate_retries += 1
+                    doc['phase'] = '正在构思故事'
+                    self.store.save(doc)
             try:
                 parsed = json_object(reply)
                 return validate(parsed)
@@ -222,13 +361,23 @@ class Author:
 
     async def generate(self, id):
         async with self.gate:
-            doc = self.store.get(id)
+            existing = self.pipelines.get(id)
+            if existing and existing.closed:
+                # A paused pipeline may be finishing cleanup as resume arrives.
+                # Wait for its final save, then load a fresh document.
+                drain = self.drains.get(id)
+                if drain:
+                    await asyncio.shield(drain)
+                existing = None
+            doc = existing.doc if existing else self.store.get(id)
             if not doc or doc["status"] == "ready":
                 return
             stage = "outline"
             length = LENGTHS.get(doc["length"], LENGTHS["short"])
+            pipeline = None
             try:
                 doc.update(status="generating", phase="正在构思故事", error=None, model=self.adapter.model)
+                doc.pop('failure_stage',None)
                 self.store.save(doc)
                 if not doc["outline"] or doc.get("continuation"):
                     catalog = [{"id": c.id, **identity(c), "intro": c.intro,
@@ -241,14 +390,14 @@ class Author:
                         "大纲、开头、场次地点与场次说明均用简体中文；日文名称保留原文时附中文解释。"
                         "本篇的趣味留在情境里，具体心意、回应和后续行动由人物在正文中自由展开。"
                         "cast选资料中的角色id，人物数量随故事需要决定，指定人物均需包含。场景为1至64场，每场place与direction填写非空文本。"
-                        "制作人的speaker是producer，cast填写偶像id；guests填写配角数组，未用配角时填写空数组。"
+                        "制作人用producer，cast填写资料中的正式角色id；guests填写新配角，未用配角时填写空数组。"
                         "场次数量随故事发展自行决定。每幕transition选择cut（剧情场景连续）、pause（时间空间小变化）或fade（时间空间大变化）。允许P和必要的虚构配角。"
                         '只输出JSON：{"cast":["偶像id"],"guests":[{"id":"friend","name":"配角称呼"}],'
                         '"opening":"供读者观看的故事开头，仅介绍起始处境，后续留给正文揭晓",'
-                        '"direction":"整体情境与松散走向","scenes":[{"place":"地点","direction":"本场情境与可展开的线索"}]}。'
+                        '"direction":"整体情境与松散走向","scenes":[{"place":"地点","direction":"本场情境与可展开的线索","speaking_roles":["producer","角色id"]}]}。'
                         "\n补充内容：" + doc.get("details", "") +
-                        "\n人物资料：" + json.dumps(catalog, ensure_ascii=False) + ("\n续写要求：" + doc["continuation"] + "\n原故事记录：" + doc["story_memory"] + "\n原大纲：" + json.dumps(doc["outline"], ensure_ascii=False) if doc.get("continuation") else ""),
-                        validate=lambda raw: validate_outline(raw, self.adapter.characters, doc["requested_cast"], doc["length"]),
+                        "\n人物资料：" + json.dumps(catalog, ensure_ascii=False) + ("\n续写要求：" + doc["continuation"] + "\n完整原剧本：" + json.dumps(full_script(doc), ensure_ascii=False) + "\n原大纲：" + json.dumps(doc["outline"], ensure_ascii=False) if doc.get("continuation") else ""),
+                        validate=lambda raw: validate_outline(raw, self.adapter.characters, doc['requested_cast'], doc['length'], previous=doc.get('outline') if doc.get('continuation') else None),
                         doc=doc, stage=stage)
                     planned = raw
                     if doc.get("continuation"):
@@ -268,78 +417,67 @@ class Author:
                     self.store.save(doc)
                     return
                 outline = doc["outline"]
-                for index in range(len(doc["scenes"]), len(outline["scenes"])):
-                    stage = f"scene-{index + 1}"
-                    doc["phase"] = f"正在写第 {index + 1} / {len(outline['scenes'])} 场"
-                    self.store.save(doc)
-                    cast = [{**identity(self.adapter.characters[cid]),
-                             "sheet": story_character_sheet(self.adapter.characters[cid].sheet),
-                             "relationship": CHARACTER_NOTES.get(cid, "")} for cid in outline["cast"]]
-                    tail = doc["scenes"][-1]["lines"][-10:] if doc["scenes"] else []
-                    raw = await self.request(
-                        "你在编写偶像同人分幕剧本及具体人物对白。人物和此前已发生的事保持连续，"
-                        "原人设承接人物身份、经历、称呼与说话习惯，人物补充提供本模块同人世界中的心意与相处，相关关系依此展开。"
-                        "人物以符合年龄的方式表达亲近与回应，制作人也以自己的感受和意愿参与。"
-                        "人物按各自性格与此刻心情自由交流，满足、迟疑、没说完的话和临时的主动都有自己的来处。"
-                        "大纲提供情境和线索，具体反应与后续行动随人物的交流展开。"
-                        "continuity与previous_ending承接已发生的事，outline与current提供接下来可展开的构思。"
-                        "只编写人物实际说出的对白，不生成心理描写、内心独白、场景铺陈或旁白；表情与演出信息放在结构字段。"
-                        "日语附中文字幕。本幕对白发生在current指定的实际地点，地点转移由大纲安排为下一幕。输出JSON。\n" + creative_guidance() + "\n" + DIALOGUE_FORMAT + "\n" + NAME_RULES,
-                        json.dumps(dict(premise=doc["premise"], details=doc.get("details", ""), outline=outline, current=outline["scenes"][index],
-                                        characters=cast, character_names=name_reference(self.adapter.characters), continuity=doc["story_memory"], previous_ending=tail,
-                                        instruction=doc.get("active_instruction", ""),
-                                        continuation_direction=doc.get("continuation_direction", ""),
-                                        final_scene=index == len(outline["scenes"]) - 1), ensure_ascii=False) +
-                        "\n整篇目标：" + length["scale"] + "，" + length["speech"] + "。本场可以约" + length["lines"] +
-                        "条具体口语对白，长短随实际交流需要，允许闲话和停顿，参考条数不限制长发言按完整句意必要分段。"
-                        '格式：{"lines":[{"speaker":"人物id或producer","ja":"日语对白",'
-                        '"zh":"中文","kind":"dialogue","emotion":"calm/happy/shy/surprised/sad/angry/thinking","voice_style":"冬优子声线natural或idol，其他角色省略","onstage":["房间内在场的偶像id"],"focus":["本句画面里交流的1至7位偶像id"],"speakers":["异口同声时的2至7位偶像id，可省略"]}],'
-                        '"memory":"合并后的简短故事记录：已发生的事、每人知道或误会什么、心意与回应带来的关系变化、约定和尚待回应的事情"}。'
-                        'onstage记录现场人物；focus选择本次交流中的说话者与交谈对象，话题转向别人时切换画面，制作人以字幕呈现。'
-                        '为非发言人物按其自身处境设置actor_states，例如{"hiori":{"emotion":"thinking","body_mood":"calm"}}。'
-                        '人物反应发生变化时才更新，不跟随主说话人的情绪逐句变化；保持同镜头人物的独立情绪。'
-                        '冬优子在外人面前维持可爱偶像形象的发言用idol声线，与熟人私下以本来语气说话用natural；根据实际情境逐句选择。'
-                        '输出前核对称呼、说话者、人物已知信息和动作衔接，保留临场变化和自然的闲话。',
-                        validate=lambda raw: validate_scene(raw, outline, index), doc=doc, stage=stage)
-                    scene = raw
-                    # Position is an outline index; identity must survive deleted/reordered scenes.
-                    identity_index = max((s.get('index', -1) for s in doc['scenes']), default=-1) + 1
-                    scene['index'] = identity_index
-                    for number, line in enumerate(scene['lines']):
-                        line['id'] = f'{identity_index}-{number}'
-                    doc["scenes"].append(scene)
-                    doc["story_memory"] = scene["memory"]
-                    self.store.save(doc)
-                    if doc.get("tuning") == "script":
-                        continue
-                    stage = "production"
-                    await self.production.prepare(doc)
-                    doc.update(status="generating", phase=f"第 {index + 1} 场已准备完成")
-                    self.store.save(doc)
+                if doc.get('tuning') != 'script':
+                    pipeline = existing or ProductionPipeline(self.production, doc)
+                    self.pipelines[id] = pipeline
+                    if existing:
+                        pipeline.resume()
+                stage = f"scene-{len(doc['scenes']) + 1}"
+                from batch_writer import write_batches
+                await write_batches(self, doc, pipeline)
                 doc.pop("active_instruction", None)
                 if doc.get("tuning") == "script":
                     doc.update(status="tuning", phase="剧本已完成")
                     self.store.save(doc)
                     return
                 stage = "production"
-                await self.production.prepare(doc)
+                await pipeline.finish()
                 doc.update(status="ready", phase="故事写好了", error=None)
+                doc.pop('failure_stage',None)
+                normalize_recovered(doc)
                 self.store.save(doc)
             except asyncio.CancelledError:
+                if pipeline and id not in self.pausing:
+                    self.pipelines.pop(id, None)
+                    await pipeline.close()
                 doc.update(status="interrupted", phase="生成中断，可以继续")
                 self.store.save(doc)
                 raise
             except Exception as error:
+                if pipeline:
+                    self.pipelines.pop(id, None)
+                    await pipeline.close()
+                if stage.startswith('scene-'):
+                    stage = f"scene-{len(doc['scenes']) + 1}"
                 # Only locally written format errors reach the UI, never provider text or credentials.
                 reason = str(error) if isinstance(error, (StoryFormatError, ProductionError)) else f"模型请求未完成（{type(error).__name__}）"
+                if isinstance(error, RateLimitError):
+                    reason = '模型服务限流或容量不足（HTTP 429），请等待片刻再试'
+                    doc['writing_failure'] = dict(kind='rate_limit', status=429)
                 where = "语音与演出" if stage == "production" else "大纲" if stage == "outline" else f"第{stage.split('-')[1]}幕"
                 log.warning("story=%s stage=%s failed type=%s", doc["id"], stage, type(error).__name__)
-                doc.update(status="failed", phase="暂时没能写完", failure_stage=stage,
+                doc.update(status="failed", phase="剧本已完成，语音与演出待补齐" if stage == "production" else "暂时没能写完", failure_stage=stage,
                            error=f"{where}生成失败：{reason}。已保存进度，可以继续。")
                 self.store.save(doc)
+
+            finally:
+                if pipeline and id not in self.pausing:
+                    drain = self.drains.pop(id, None)
+                    if drain:
+                        drain.cancel()
+                        await asyncio.gather(drain, return_exceptions=True)
+                    if self.pipelines.get(id) is pipeline:
+                        self.pipelines.pop(id, None)
+                    await pipeline.close()
 
     async def close(self):
         tasks = list(self.tasks.values())
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        drains = list(self.drains.values())
+        for task in drains:
+            task.cancel()
+        await asyncio.gather(*drains, return_exceptions=True)
+        await asyncio.gather(*(pipeline.close() for pipeline in self.pipelines.values()))
+        self.pipelines.clear()

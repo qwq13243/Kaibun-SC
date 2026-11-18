@@ -15,7 +15,8 @@ import uuid
 from array import array
 from pathlib import Path
 
-from production import cached_audio, voice_lines, Production
+from production import cached_audio, voice_inventory, voice_lines, voice_targets, Production
+from stage_states import cast_for, scene_shots
 
 
 def ffmpeg_path():
@@ -70,33 +71,6 @@ def calibration_lead(exe, video):
     raise ValueError('未找到完整的导出校准帧，请重新导出，不复用旧录制缓存')
 
 
-def cast_for(lines, index, cast):
-    line = lines[index]
-    def ordered(visible):
-        return list(dict.fromkeys([cid for cid in line.get('actor_order', []) if cid in visible] + visible))
-    if 'screen_cast' in line:
-        return ordered([cid for cid in line['screen_cast'] if cid in cast][:7])
-    present = set(line.get('onstage', cast))
-    present.add(line.get('speaker'))
-    chosen = []
-    def add(cid):
-        if cid in cast and cid in present and cid not in chosen and len(chosen) < 5:
-            chosen.append(cid)
-    if line.get('speakers'):
-        return ordered([cid for cid in cast if cid in line['speakers']][:7])
-    add(line.get('speaker'))
-    if line.get('focus'):
-        anchor = index
-        while anchor and lines[anchor - 1].get('speaker') == line.get('speaker'):
-            anchor -= 1
-        for cid in lines[anchor].get('focus') or line['focus']:
-            add(cid)
-    else:
-        for entry in list(reversed(lines[max(0, index - 5):index])) + lines[index + 1:index + 5]:
-            add(entry.get('speaker'))
-    return ordered([cid for cid in cast if cid in chosen])
-
-
 def pose_for(lines, index, cast, cid):
     from stage_states import pose_for as resolve
     return resolve(lines, index, cast, cid, cast_for)
@@ -134,7 +108,7 @@ class VideoExport:
                 return None
             stat = path.stat()
             voices.append((line['id'], path.name, stat.st_size, stat.st_mtime_ns))
-        data = {'version': 25, 'scenes': doc['scenes'], 'outline': doc.get('outline'), 'voices': voices}
+        data = {'version': 31, 'scenes': doc['scenes'], 'outline': doc.get('outline'), 'voices': voices}
         return hashlib.sha256(json.dumps(data, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
 
     def output_path(self, doc):
@@ -181,13 +155,14 @@ class VideoExport:
         job = self.jobs[doc.get('export_id', sid)]
         try:
             exe = ffmpeg_path()
-            missing = [line for line in voice_lines(doc, self.adapter) if not cached_audio(self.store, self.adapter, sid, line)]
+            targets, ready = voice_inventory(self.store, self.adapter, doc)
+            missing = [line for line in targets if line['id'] not in ready]
             for index, line in enumerate(missing):
                 if self.cancel_events[doc.get('export_id', sid)].is_set():
                     raise ValueError('导出已停止')
                 job['message'] = f'正在补全缺失语音 {index + 1} / {len(missing)}'
                 try:
-                    await self.production.ensure_voice(sid, line)
+                    await self.production.produce_voice(sid, line)
                 except Exception:
                     raise ValueError('缺失语音补全失败，请检查语音服务后重试') from None
             fingerprint = self.fingerprint(doc)
@@ -199,16 +174,11 @@ class VideoExport:
                     if line.get('speaker') == 'narrator':
                         continue
                     audios = []
-                    for cid in line.get('speakers') or [line.get('speaker')]:
-                        if hasattr(self.adapter, 'has_voice') and not self.adapter.has_voice(cid):
-                            continue
-                        if cid not in self.adapter.characters and not (cid == "producer" and os.environ.get("KAIBUN_PRODUCER_VOICE_ID")):
-                            continue
-                        voice = dict(line, speaker=cid, id=line['id'] + '~' + cid) if line.get('speakers') else line
+                    for voice in voice_targets(line, self.adapter):
                         audio = cached_audio(self.store, self.adapter, sid, voice)
                         if not audio:
                             raise ValueError('有配音尚未准备好，请先继续完成这篇故事的语音')
-                        audios.append(audio)
+                        audios.append((voice['speaker'], audio))
                     entries.append((scene, line, audios))
             if not entries:
                 raise ValueError('这篇故事还没有可以导出的对话')
@@ -272,15 +242,18 @@ class VideoExport:
             new_scene = scene is not active_scene
             if new_scene:
                 active_scene = scene
-                outfits, background = dict(scene.get('outfits') or {}), scene.get('background')
-            outfits.update((scene.get('outfit_changes') or {}).get(line['id'], {}))
-            background = (scene.get('background_changes') or {}).get(line['id'], background)
+                shots = scene_shots(scene, cast, doc['id'])
+            frame = shots[line['id']]
+            outfits, background = frame['outfits'], frame['background']
             decoded = []
-            for path in audio_files:
+            voice_durations = {}
+            for actor, path in audio_files:
                 result = subprocess.run([exe, '-v', 'error', '-i', str(path), '-f', 's16le', '-ac', '2', '-ar', '24000', 'pipe:1'], capture_output=True, creationflags=flags)
                 if result.returncode:
                     raise ValueError('有语音文件无法读取，请重新准备这句配音')
                 data = array('h'); data.frombytes(result.stdout); decoded.append(data)
+                if data:
+                    voice_durations[actor] = len(data) / 48000
             length = max((len(a) for a in decoded), default=0)
             if len(decoded) == 1:
                 mixed = decoded[0]
@@ -290,25 +263,24 @@ class VideoExport:
                     for i, value in enumerate(data):
                         mixed[i] = max(-32768, min(32767, mixed[i] + value // len(decoded)))
             sounds.append(mixed)
-            duration = length / 48000 + .45 if length else (min(20, max(5, len(line.get('zh', '')) * .15)) if line.get('kind') == 'thought' else min(12, max(3, len(line.get('zh', '')) * .115)))
-            line_index = scene['lines'].index(line)
-            shot = cast_for(scene['lines'], line_index, cast)
+            thought = frame['thought']
+            duration = length / 48000 + .45 if length else (min(20, max(5, len(line.get('zh', '')) * .15)) if thought else min(12, max(3, len(line.get('zh', '')) * .115)))
+            shot = frame['cast']
             actors = []
             for cid in shot:
                 character = self.adapter.characters.get(cid)
                 oid = outfits.get(cid) or getattr(character, 'default_outfit', None)
                 if not oid or oid not in self.adapter.wardrobe.entries:
-                    actors.append(dict(id=cid, name=getattr(character, 'short_name', None) or getattr(character, 'name', cid), outfit=None, speaking=False, isSpeaker=cid == line.get('speaker'), mood='calm', variant=0, bodyMood=None))
+                    actors.append(dict(id=cid, name=getattr(character, 'short_name', None) or getattr(character, 'name', cid), outfit=None, speaking=False, isSpeaker=cid in (line.get('speakers') or [line.get('speaker')]), mood='calm', bodyVariant=0, bodyMood=None))
                     continue
-                speaking = (cid == line.get('speaker') or cid in (line.get('speakers') or [])) and bool(length) and line.get('kind') != 'thought'
-                mood, variant, body_mood = pose_for(scene['lines'], line_index, cast, cid)
-                actors.append(dict(id=cid, outfit=oid, height=((self.adapter.outfit(cid, oid) or {}).get("bounds") or {}).get("height", 1000), speaking=speaking, isSpeaker=(cid in (line.get('speakers') or [line.get('speaker')])), mood=mood, variant=variant, bodyMood=body_mood))
+                visual = frame['poses'][cid]
+                actors.append(dict(**visual, id=cid, outfit=oid, height=((self.adapter.outfit(cid, oid) or {}).get('bounds') or {}).get('height', 1000), speaking=cid in voice_durations and not thought, voiceDuration=voice_durations.get(cid, 0), isSpeaker=cid in (line.get('speakers') or [line.get('speaker')])))
             char = self.adapter.characters.get(line.get('speaker'))
             color = getattr(char, 'color', None) or '#324d74'
             if not re.fullmatch(r'#[0-9a-fA-F]{6}', color): color = '#324d74'
             subtitle = line.get('zh', '')
             bg = self.adapter.backgrounds.image_path(background)
-            items.append(dict(actors=actors, segments=line.get("performance_segments") or [], zh=subtitle, pages=subtitle_pages(subtitle), transition=((scene.get('transition', 'cut') if new_scene and items else scene.get('line_transitions', {}).get(line['id'], 'cut')) if items else 'cut'), transition_length=(scene.get('transition_length', 'short') if new_scene else scene.get('line_transition_lengths', {}).get(line['id'], 'short')), color=color, background='/backgrounds/' + bg.name if bg else '', cue_duration=(length / 48000 if length else duration), duration=duration, variant=(int(line['id'].split('-')[-1]) // 2 if line['id'].split('-')[-1].isdigit() else 0)))
+            items.append(dict(actors=actors, line={key:line[key] for key in ("speaker", "speakers", "emotion", "actor_states", "body_action", "last_fine_edit_token") if key in line}, segments=line.get("performance_segments") or [], zh=subtitle, pages=subtitle_pages(subtitle), transition=((scene.get('transition', 'cut') if new_scene and items else scene.get('line_transitions', {}).get(line['id'], 'cut')) if items else 'cut'), transition_length=(scene.get('transition_length', 'short') if new_scene else scene.get('line_transition_lengths', {}).get(line['id'], 'short')), color=color, background='/backgrounds/' + bg.name if bg else '', cue_duration=(length / 48000 if length else duration), duration=duration, variant=(int(line['id'].split('-')[-1]) // 2 if line['id'].split('-')[-1].isdigit() else 0)))
         root = Path(__file__).resolve().parents[1]
         folder = Path(doc['recording_directory'])
         folder.mkdir(parents=True, exist_ok=True)

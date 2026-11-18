@@ -26,9 +26,13 @@ from adapters import ProjectAdapter  # noqa: E402 - local read-only adapter requ
 from author import Author  # noqa: E402
 from store import StoryStore  # noqa: E402
 from performance import normalize_segments, recover_split_audio
-from production import cached_audio, voice_lines  # noqa: E402
+from production import cached_audio, voice_inventory, voice_lines, voice_targets  # noqa: E402
+from stage_states import scene_shots
 from video_export import VideoExport  # noqa: E402
 from voice_errors import voice_failure
+from production_state import story_work
+from outfit_policy import OutfitMode, Season, load_seasonal_outfits, season_outfit
+from scene_production import apply_scene_outfits
 
 
 def create_app(store, adapter, api_token=None):
@@ -45,7 +49,6 @@ def create_app(store, adapter, api_token=None):
         if doc["status"] == "ready" and not doc.get("production_version"):
             lines = voice_lines(doc, adapter)
             done = sum(cached_audio(store, adapter, doc["id"], line) is not None for line in lines)
-            staged = True
             for scene in doc["scenes"]:
                 outfits = scene.setdefault("outfits", {})
                 for cid in doc["outline"]["cast"]:
@@ -53,10 +56,8 @@ def create_app(store, adapter, api_token=None):
                     default = getattr(character, "default_outfit", None)
                     if default and hasattr(adapter, "outfit") and adapter.outfit(cid, default):
                         outfits.setdefault(cid, default)
-                    elif default:
-                        staged = False
-            doc["production"] = dict(voices_done=done, voices_total=len(lines), staging_done=staged)
-            if done == len(lines) and staged:
+            doc["production"] = dict(voices_done=done, voices_total=len(lines), staging_done=True)
+            if done == len(lines):
                 doc["production_version"] = 1
             else:
                 doc.update(status="interrupted", phase="剧本已保存，继续准备语音与演出", error=None)
@@ -105,9 +106,13 @@ def create_app(store, adapter, api_token=None):
                         from revisions import fingerprint
                         if expected != fingerprint(current):
                             return JSONResponse({'detail': '剧本已更新，请刷新后重新操作'}, status_code=409)
-                safe = {'stop', 'resume', 'tune', 'tune-apply', 'tune-discard', 'tune-undo', 'rename', 'pin', 'delete'}
-                if current and action not in safe and not action.startswith('audio/') and (sid in author.tasks or current.get('revision_proposal')):
-                    return JSONResponse({'detail': '请先完成当前调整，并应用或放弃修改预览'}, status_code=409)
+                safe = {'stop', 'voices/stop', 'resume', 'production/retry', 'tune', 'tune-apply', 'tune-discard', 'tune-undo', 'rename', 'pin', 'delete'}
+                if current and action not in {'export', 'export/stop', 'rename', 'pin', 'delete'} and not action.startswith('audio/') and is_exporting(sid):
+                    return JSONResponse({'detail': '请先完成或暂停视频导出'}, status_code=409)
+                if current and action not in safe and not action.startswith('audio/') and (author.busy(sid) or current.get('revision_proposal')):
+                    if sid in author.pipelines and sid not in author.tasks:
+                        return JSONResponse({'detail': '写作已暂停，配音与演出仍在继续；请等待完成后调整'}, status_code=409)
+                    return JSONResponse({'detail': '请先完成当前写作或制作，并处理待确认的修改预览'}, status_code=409)
         return await call_next(request)
 
     @app.middleware('http')
@@ -134,6 +139,7 @@ def create_app(store, adapter, api_token=None):
 
     def presentation(doc):
         result = deepcopy(doc)
+        from production_state import normalize_recovered
         from revisions import fingerprint
         result['base_fingerprint'] = fingerprint(doc)
         result['revision_history_count'] = len(doc.get('revision_history') or [])
@@ -142,10 +148,17 @@ def create_app(store, adapter, api_token=None):
         if isinstance(result.get('production'), dict):
             # Readiness was recorded under the old pronunciation/cache rules.
             # Recheck files rather than claiming all voices still exist.
-            targets = voice_lines(doc, adapter)
-            done = sum(bool(cached_audio(store, adapter, doc['id'], line)) for line in targets)
-            result['production'].update(voices_done=done, voices_total=len(targets))
+            targets, ready = voice_inventory(store, adapter, doc)
+            result['production'].update(voices_done=len(ready), voices_total=len(targets))
+            normalize_recovered(result)
+        result['work'] = work_for(result)
         for scene in result["scenes"]:
+            shots = scene_shots(scene, (result.get('outline') or {}).get('cast', []), doc['id'])
+            for line in scene['lines']:
+                line['shot'] = shots[line['id']]
+                line['voice_targets'] = {target['speaker']: target['id'] for target in voice_targets(line, adapter)}
+                if line['shot']['thought']:
+                    line['kind'] = 'thought'
             scene["wardrobe"] = {cid: outfit for cid, oid in scene.get("outfits", {}).items()
                                  if (outfit := adapter.outfit(cid, oid)) is not None}
             scene["wardrobe_changes"] = {
@@ -156,6 +169,12 @@ def create_app(store, adapter, api_token=None):
                 scene["background_change_assets"] = {lid: adapter.backgrounds.card(bid)
                                                       for lid, bid in scene.get("background_changes", {}).items()}
         return result
+
+    def is_exporting(sid):
+        return any(job.get('status') == 'working' for key, job in exports.jobs.copy().items() if key == sid or key.startswith(sid+'-scene-'))
+
+    def work_for(doc):
+        return story_work(doc, busy=author.busy(doc['id']), exporting=is_exporting(doc['id']))
 
     def scoped_export(doc, scene):
         if scene is None: return doc
@@ -180,11 +199,11 @@ def create_app(store, adapter, api_token=None):
     @app.get('/stories/{id}/export-check')
     async def export_check(id: str, scene: int | None = None):
         doc = scoped_export(story_or_404(id), scene)
-        targets = voice_lines(doc, adapter)
-        missing = [line['id'] for line in targets if not cached_audio(store, adapter, id, line)]
+        targets, ready = voice_inventory(store, adapter, doc)
+        missing = [line['id'] for line in targets if line['id'] not in ready]
         invalidated = [line['id'] for s in doc['scenes'] for line in s['lines'] if line.get('performance_invalidated')]
         untranslated = [line['id'] for s in doc['scenes'] for line in s['lines'] if line.get('imported_untranslated')]
-        return dict(missing_audio=missing, performance_review=invalidated, untranslated=untranslated, voice_total=len(targets), ready=doc['status'] == 'ready' and not untranslated)
+        return dict(missing_audio=missing, performance_review=invalidated, untranslated=untranslated, voice_total=len(targets), ready=doc['status'] == 'ready' and not untranslated and not invalidated)
 
     @app.post('/stories/{id}/export/stop')
     async def stop_export(id: str, scene: int | None = None):
@@ -215,7 +234,7 @@ def create_app(store, adapter, api_token=None):
         length: Literal["short", "standard", "half_hour", "hour_plus"] = "short"
         details: str = Field(default="", max_length=12000)
         outfits: dict[str, str] = Field(default_factory=dict)
-        outfit_mode: Literal["story", "fixed"] = "story"
+        outfit_mode: OutfitMode = "default"
         tuning: bool = False
 
     @app.get("/health")
@@ -320,7 +339,8 @@ def create_app(store, adapter, api_token=None):
 
     @app.get("/stories/{id}")
     async def get_story(id: str):
-        return presentation(story_or_404(id))
+        # Whole-story checks must not hold the event loop that serves playback.
+        return await asyncio.to_thread(lambda: presentation(story_or_404(id)))
 
     from revisions import install_revision_routes
     install_revision_routes(app, store, adapter, author, exports, story_or_404, presentation)
@@ -336,6 +356,10 @@ def create_app(store, adapter, api_token=None):
         nichika_voice_style: Literal['natural', 'idol'] | None = None
         emotion: Literal["calm", "happy", "shy", "surprised", "sad", "angry", "thinking"] | None = None
         body_mood: Literal["calm", "happy", "shy", "surprised", "sad", "angry", "thinking"] | None = None
+        expression: str | None = None
+        body_action: str | None = None
+        mouth_action: str | None = None
+        rest_mouth_action: str | None = None
         actor_states: dict[str, dict[str, str | None]] | None = None
         listener_state_persist: bool | None = None
         onstage: list[str] | None = None
@@ -348,7 +372,7 @@ def create_app(store, adapter, api_token=None):
     @app.post("/stories/{id}/lines/{line_id}/fine-tune")
     async def fine_tune_line(id: str, line_id: str, body: EditLine):
         doc = story_or_404(id)
-        if id in author.tasks or any(job.get("status") == "working" for key, job in exports.jobs.items() if key == id or key.startswith(id + "-scene-")):
+        if author.busy(id) or any(job.get("status") == "working" for key, job in exports.jobs.items() if key == id or key.startswith(id + "-scene-")):
             raise HTTPException(409, "请先停止当前制作或导出")
         line = next((line for scene in doc["scenes"] for line in scene["lines"] if line["id"] == line_id), None)
         if line is None:
@@ -367,6 +391,12 @@ def create_app(store, adapter, api_token=None):
             line["voice_style"] = body.voice_style
         if body.emotion is not None:
             line["emotion"] = body.emotion
+        from visual_fields import expression_valid, body_valid, actor_state, mouth_valid
+        for field,check in (('expression',expression_valid),('body_action',body_valid),('mouth_action',mouth_valid),('rest_mouth_action',mouth_valid)):
+            if field in body.model_fields_set:
+                value=getattr(body,field)
+                if not check(value): raise HTTPException(422,'未知表情或动作')
+                line[field]=value
         if 'body_mood' in body.model_fields_set:
             if body.body_mood is None:
                 line.pop('body_mood', None)
@@ -389,7 +419,8 @@ def create_app(store, adapter, api_token=None):
             for cid, state in body.actor_states.items():
                 if cid not in adapter.characters or not isinstance(state, dict):
                     raise HTTPException(422, '角色动作设置无效')
-                states[cid] = {key: value for key, value in state.items() if key in ('emotion', 'body_mood') and (value in ('calm', 'happy', 'shy', 'surprised', 'sad', 'angry', 'thinking') or key == 'body_mood' and value is None)}
+                try: states[cid] = actor_state(state)
+                except ValueError as error: raise HTTPException(422,str(error)) from None
             line['actor_states'] = states
         if body.performance_segments is not None:
             try:
@@ -410,19 +441,21 @@ def create_app(store, adapter, api_token=None):
                 line['screen_cast'] = list(dict.fromkeys(people + selected))[:7]
             else:
                 line.pop('speakers', None)
-        targets = [dict(line, speaker=cid, id=line['id'] + '~' + cid) if line.get('speakers') else line for cid in (line.get('speakers') or [line['speaker']]) if cid in adapter.characters or (cid == 'producer' and os.environ.get('KAIBUN_PRODUCER_VOICE_ID'))]
         # Commit the edit before voice generation: a provider failure must not lose it.
         if body.voice_style is not None and line['speaker'] == 'fuyuko':
             line['voice_style'] = body.voice_style
         if body.nichika_voice_style is not None and 'nichika' in (line.get('speakers') or [line['speaker']]):
             line['nichika_voice_style'] = body.nichika_voice_style
+        targets = voice_targets(line, adapter)
         current_voice = [(target['id'], adapter.voice_signature(target)[0]) for target in targets]
         if previous_voice != current_voice:
             line['audio_revision'] = uuid.uuid4().hex
         store.save(doc)
         if body.regenerate:
             try:
-                await asyncio.gather(*(author.production.ensure_voice(id, target) for target in targets))
+                results = await asyncio.gather(*(author.production.produce_voice(id, target) for target in targets), return_exceptions=True)
+                if error := next((value for value in results if isinstance(value, Exception)), None):
+                    raise error
             except Exception as error:
                 from revisions import fingerprint
                 return JSONResponse(status_code=502, content={
@@ -437,7 +470,7 @@ def create_app(store, adapter, api_token=None):
     @app.post('/stories/{id}/lines/{line_id}/delete')
     async def delete_fine_line(id: str, line_id: str):
         doc = story_or_404(id)
-        if id in author.tasks or any(job.get('status') == 'working' for key, job in exports.jobs.items() if key == id or key.startswith(id + '-scene-')):
+        if author.busy(id) or any(job.get('status') == 'working' for key, job in exports.jobs.items() if key == id or key.startswith(id + '-scene-')):
             raise HTTPException(409, '请先停止当前制作或导出')
         scene = next((s for s in doc['scenes'] if any(l['id'] == line_id for l in s['lines'])), None)
         if scene is None:
@@ -461,7 +494,7 @@ def create_app(store, adapter, api_token=None):
     @app.post("/stories/{id}/scenes/{index}/reorder")
     async def change_scene_order(id: str, index: int, body: OrderScene):
         doc = story_or_404(id)
-        if doc.get("status") != "tuning" or doc.get("tuning") != "script" or id in author.tasks:
+        if doc.get("status") != "tuning" or doc.get("tuning") != "script" or author.busy(id):
             raise HTTPException(409, "请先完成剧本生成")
         if not 0 <= index < len(doc["scenes"]):
             raise HTTPException(404, "没有这一幕")
@@ -489,7 +522,7 @@ def create_app(store, adapter, api_token=None):
     @app.post("/stories/{id}/scenes/{index}/lines")
     async def change_scene_lines(id: str, index: int, body: OrderLines):
         doc = story_or_404(id)
-        if doc.get("status") != "tuning" or doc.get("tuning") != "script" or id in author.tasks:
+        if doc.get("status") != "tuning" or doc.get("tuning") != "script" or author.busy(id):
             raise HTTPException(409, "请先完成剧本生成")
         if not 0 <= index < len(doc["scenes"]):
             raise HTTPException(404, "没有这一幕")
@@ -561,7 +594,7 @@ def create_app(store, adapter, api_token=None):
     @app.post("/stories/{id}/tune-next")
     async def tune_next(id: str):
         doc = story_or_404(id)
-        if doc.get("status") != "tuning" or id in author.tasks or doc.get("revision_progress", {}).get("status") == "working":
+        if doc.get("status") != "tuning" or author.busy(id) or doc.get("revision_progress", {}).get("status") == "working":
             raise HTTPException(409, "请等待当前调整完成")
         if doc.get('tuning') == 'script' and any(l.get('imported_untranslated') for scene in doc['scenes'] for l in scene['lines']):
             raise HTTPException(422, '导入内容尚未整理为双语台词，请先生成并应用修改预览，或逐句编辑日文和中文')
@@ -578,7 +611,7 @@ def create_app(store, adapter, api_token=None):
     @app.post("/stories/{id}/scenes/{index}/transition")
     async def set_transition(id: str, index: int, body: SceneTransition):
         doc = story_or_404(id)
-        if id in author.tasks: raise HTTPException(409, "请等待当前任务完成")
+        if author.busy(id): raise HTTPException(409, "请等待当前任务完成")
         if not 0 <= index < len(doc['outline']['scenes']): raise HTTPException(404, "没有这一幕")
         doc['outline']['scenes'][index]['transition'] = body.transition
         doc['outline']['scenes'][index]['transition_length'] = body.duration
@@ -591,7 +624,7 @@ def create_app(store, adapter, api_token=None):
     @app.post("/stories/{id}/scenes/{index}/lines/{line_id}/transition")
     async def set_line_transition(id: str, index: int, line_id: str, body: SceneTransition):
         doc = story_or_404(id)
-        if id in author.tasks: raise HTTPException(409, "请等待当前任务完成")
+        if author.busy(id): raise HTTPException(409, "请等待当前任务完成")
         if not 0 <= index < len(doc['scenes']) or not any(l['id'] == line_id for l in doc['scenes'][index]['lines']): raise HTTPException(404, "没有这句台词")
         doc['scenes'][index].setdefault('line_transitions', {})[line_id] = body.transition
         doc['scenes'][index].setdefault('line_transition_lengths', {})[line_id] = body.duration
@@ -623,16 +656,36 @@ def create_app(store, adapter, api_token=None):
     @app.post("/stories/{id}/scenes/{index}/outfit")
     async def set_scene_outfit(id: str, index: int, body: SceneOutfit):
         doc = story_or_404(id)
-        if id in author.tasks:
+        if author.busy(id):
             raise HTTPException(409, "请先停止当前制作")
         if not 0 <= index < len(doc['scenes']) or body.character not in doc['outline']['cast'] or not adapter.outfit(body.character, body.outfit):
             raise HTTPException(422, "请选择本故事人物的有效服装")
-        for scene in doc['scenes'][index:] if body.apply_later else [doc['scenes'][index]]:
-            scene.setdefault('outfits', {})[body.character] = body.outfit
-            for changes in scene.get('outfit_changes', {}).values():
-                changes.pop(body.character, None)
+        apply_scene_outfits(doc, index, {body.character: body.outfit}, body.apply_later)
         store.save(doc)
         return presentation(doc)
+
+    class SceneSeason(BaseModel):
+        season: Season
+        apply_later: bool = True
+
+    @app.post("/stories/{id}/scenes/{index}/outfit-season")
+    async def set_scene_season(id: str, index: int, body: SceneSeason):
+        doc = story_or_404(id)
+        if author.busy(id):
+            raise HTTPException(409, "请先停止当前制作")
+        if not 0 <= index < len(doc['scenes']) or not doc.get('outline'):
+            raise HTTPException(404, "没有这一幕")
+        seasonal = load_seasonal_outfits()
+        choices, skipped = {}, []
+        for cid in doc['outline']['cast']:
+            if oid := season_outfit(seasonal, adapter.outfit, cid, body.season):
+                choices[cid] = oid
+            else:
+                skipped.append(cid)
+        if choices:
+            apply_scene_outfits(doc, index, choices, body.apply_later)
+            store.save(doc)
+        return dict(story=presentation(doc), applied=list(choices), skipped=skipped)
 
     class PinStory(BaseModel):
         pinned: bool
@@ -653,8 +706,8 @@ def create_app(store, adapter, api_token=None):
         doc = story_or_404(id)
         if not doc.get("outline") or len(doc["scenes"]) < len(doc["outline"]["scenes"]):
             raise HTTPException(409, "请先完成剧本")
-        if id in author.tasks:
-            await author.stop(id)
+        if author.busy(id):
+            await author.stop(id, production=True)
         return presentation(story_or_404(id))
 
     @app.post("/stories/{id}/revise")
@@ -662,13 +715,16 @@ def create_app(store, adapter, api_token=None):
         source = story_or_404(id)
         if not source.get("outline") or len(source["scenes"]) < len(source["outline"]["scenes"]):
             raise HTTPException(409, "请先完成剧本")
-        if id in author.tasks:
-            await author.stop(id)
+        if author.busy(id):
+            await author.stop(id, production=True)
             source = story_or_404(id)
         title = source.get("title", source["premise"]) + "·改"
         doc = store.create(source["premise"], source.get("requested_cast", []), source["length"], source.get("details", ""), source.get("requested_outfits", {}), source.get("outfit_mode", "story"))
         doc.update(title=title, custom_title=title, outline=deepcopy(source["outline"]), scenes=deepcopy(source["scenes"]),
                    story_memory=source.get("story_memory", ""), tuning="script", status="tuning", phase="调整剧本", revision_of=id, production=None, production_version=None, revision_epoch=0)
+        for key in ('outfit_profile', 'outfit_scope_start', 'continuation_direction'):
+            if key in source:
+                doc[key] = source[key]
         store.save(doc)
         for target in voice_lines(doc, adapter):
             cached_audio(store, adapter, doc['id'], target)
@@ -684,7 +740,7 @@ def create_app(store, adapter, api_token=None):
         story_or_404(id)
         deleting_stories.add(id)
         try:
-            await author.stop(id)
+            await author.stop(id, production=True)
             await exports.stop_story(id)
             # Materialize exact matching voices in surviving revision copies
             # before removing the source, including copies made by older code.
@@ -731,16 +787,29 @@ def create_app(store, adapter, api_token=None):
 
     @app.post("/stories/{id}/stop")
     async def stop(id: str):
+        doc = story_or_404(id)
+        if work_for(doc)['actions']['pause_writing'] or (doc.get('revision_progress') or {}).get('status') == 'working':
+            await author.stop(id)
+        return presentation(story_or_404(id))
+
+    class RetryProduction(BaseModel):
+        scope: Literal['staging','voices','all']='staging'
+
+    @app.post('/stories/{id}/production/retry',status_code=202)
+    async def retry_production(id:str,body:RetryProduction):
         story_or_404(id)
-        await author.stop(id)
-        return store.get(id)
+        if any(job.get('status')=='working' for key,job in exports.jobs.items() if key==id or key.startswith(id+'-scene-')):
+            raise HTTPException(409,'请先暂停视频导出')
+        try:doc=author.retry_production(id,body.scope)
+        except ValueError as error:raise HTTPException(409,str(error)) from None
+        return presentation(doc)
 
     class ContinueStory(BaseModel):
         instruction: str = Field(min_length=1, max_length=2000)
         cast: list[str] | None = None
         outfits: dict[str, str] | None = None
         length: Literal["short", "standard", "half_hour", "hour_plus"] | None = None
-        outfit_mode: Literal["story", "fixed"] | None = None
+        outfit_mode: OutfitMode | None = None
         tuning: bool = False
 
     @app.post("/stories/{id}/continue", status_code=202)
@@ -748,8 +817,8 @@ def create_app(store, adapter, api_token=None):
         doc = story_or_404(id)
         if not doc.get("outline") or len(doc["scenes"]) < len(doc["outline"]["scenes"]):
             raise HTTPException(409, "请先完成剧本")
-        if id in author.tasks:
-            await author.stop(id)
+        if author.busy(id):
+            await author.stop(id, production=True)
             doc = story_or_404(id)
         if body.cast is not None:
             if any(cid not in adapter.characters for cid in body.cast):
@@ -763,6 +832,10 @@ def create_app(store, adapter, api_token=None):
             doc["length"] = body.length
         if body.outfit_mode is not None:
             doc["outfit_mode"] = body.outfit_mode
+            if body.outfit_mode != "fixed":
+                doc['outfit_scope_start'] = len(doc['scenes'])
+                doc.pop('outfit_profile', None)
+                doc.pop('fixed_outfits', None)
         if body.tuning:
             doc["tuning"] = "outline"
         store.save(doc)
@@ -777,7 +850,7 @@ def create_app(store, adapter, api_token=None):
     async def voice(id: str, line_id: str):
         doc = story_or_404(id)
         line = next((line for line in voice_lines(doc, adapter) if line["id"] == line_id), None)
-        if not line or (line["speaker"] not in adapter.characters and not (line["speaker"] == "producer" and os.environ.get("KAIBUN_PRODUCER_VOICE_ID"))):
+        if not line:
             raise HTTPException(404, "这句不需要配音")
         path = cached_audio(store, adapter, id, line)
         if path is None:

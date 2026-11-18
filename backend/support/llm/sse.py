@@ -6,7 +6,7 @@ from typing import Any
 
 import httpx
 
-from support.llm import LLMError
+from support.llm import LLMError, RateLimitError
 
 
 async def stream_events(
@@ -16,6 +16,8 @@ async def stream_events(
     or a reply that is not a stream at all, is an `LLMError`."""
     try:
         async with client.stream("POST", url, json=body, headers=headers) as res:
+            if res.status_code == 429:
+                raise RateLimitError(res.headers.get('Retry-After'))
             if res.status_code >= 400:
                 await res.aread()
                 raise LLMError(f"模型返回 {res.status_code}: {res.text[:500]}")

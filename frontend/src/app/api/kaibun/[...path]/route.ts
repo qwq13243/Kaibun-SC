@@ -7,12 +7,15 @@ export const runtime = "nodejs";
 
 async function proxy(request: NextRequest, context: { params: Promise<{ path: string[] }> }) {
   const host = request.headers.get('host')?.split(':')[0];
-  if (host !== 'localhost' && host !== '127.0.0.1') return new Response(null, { status: 403 });
+  if (host !== 'localhost' && host !== '127.0.0.1') return Response.json({detail:"请从本机页面操作"}, { status: 403 });
   const { path } = await context.params;
-  if (path.some((part) => part === "." || part === "..")) return new Response(null, { status: 400 });
+  if (path.some((part) => part === "." || part === "..")) return Response.json({detail:"请求路径无效"}, { status: 400 });
   if (request.method === "POST") {
     const origin = request.headers.get("origin");
-    if (origin && origin !== request.nextUrl.origin) return new Response(null, { status: 403 });
+    // Next may canonicalize 127.0.0.1 to localhost in nextUrl. Both loopback
+    // origins are the same local application and are already accepted upstream.
+    const allowed = new Set(["http://localhost:3010", "http://127.0.0.1:3010"]);
+    if (origin && !allowed.has(origin)) return Response.json({detail:"请从本机页面操作"}, { status: 403 });
   }
   try {
     const connection = JSON.parse(await readFile(resolve(process.cwd(), '../.runtime/connection.json'), 'utf8'));
@@ -26,7 +29,7 @@ async function proxy(request: NextRequest, context: { params: Promise<{ path: st
         ...(request.headers.get("if-none-match") ? { "if-none-match": request.headers.get("if-none-match")! } : {}) },
       body: request.method === "GET" ? undefined : await request.arrayBuffer(),
       cache: "no-store",
-      signal: AbortSignal.timeout(path.includes("tune") ? 900_000 : 120_000),
+      signal: AbortSignal.any([request.signal, AbortSignal.timeout(path.includes("tune") ? 900_000 : 120_000)]),
     });
     return new Response(response.body, { status: response.status, headers: {
       "Content-Type": response.headers.get("content-type") ?? "application/json",

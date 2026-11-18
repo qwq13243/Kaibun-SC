@@ -108,6 +108,12 @@ class LLMError(RuntimeError):
     cannot read."""
 
 
+class RateLimitError(LLMError):
+    def __init__(self, retry_after: str | None = None):
+        super().__init__('模型服务限流或容量不足（HTTP 429）')
+        self.retry_after = retry_after
+
+
 def _no_hold() -> Callable[[], None]:
     return _let_go
 

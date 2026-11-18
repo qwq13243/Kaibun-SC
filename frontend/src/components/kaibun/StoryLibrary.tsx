@@ -14,7 +14,6 @@ export function StoryLibrary({ stories, selected, onSelect, onPin, onDelete, onR
   onPin: (story: StoryBrief) => void; onDelete: (story: StoryBrief) => void; onRename: (story: StoryBrief) => void;
 }) {
   return <div className="flex flex-col py-2">
-    {!stories.length && <p className="px-4 py-6 text-sm text-muted-foreground">{t.emptyLibrary}</p>}
     {stories.map(story => <LibraryRow key={story.id} story={story} selected={selected === story.id} onSelect={() => onSelect(story.id)} onPin={() => onPin(story)} onDelete={() => onDelete(story)} onRename={() => onRename(story)} />)}
   </div>;
 }

@@ -10,7 +10,18 @@ export type Nod = { kind: "yes" | "no"; id: number };
 
 /** How she should look right now, with no word of which animations do it. */
 export type StandDirection = {
-  /** Optional story-line variation for repeated emotional beats. */
+  idleOnly?: boolean;
+  idleSeed?: string;
+  entrySeed?: string;
+  idleEntrance?: boolean;
+  faceAction?:string;
+  mouthAction?:string;
+  restMouthAction?:string;
+  /** Exact original face clip; speech emotion remains independent. */
+  expression?: string | null;
+  /** Body-only director selection; never changes the facial emotion. */
+  bodyAction?: string;
+  /** Legacy story beat counter; it must not insert idle between spoken lines. */
   bodyVariant?: number;
   /** Independently selected body movement; omitted follows the facial emotion. */
   bodyMood?: Emotion;
@@ -43,12 +54,12 @@ export type TrackAnimations = {
 
 /** Body animations for each emotion, the first the outfit has being played; `wait` if none. */
 const BODY: Record<Emotion, string[]> = {
-  calm: ["wait"],
-  happy: ["smile1", "smile2"],
-  shy: ["shy1", "shy2", "smile2"],
-  surprised: ["surp1", "surp2"],
-  sad: ["sad1", "sad2"],
-  angry: ["anger1", "anger2"],
+  calm: ["wait", "wait1", "wait2", "wait3", "wait4", "wait5", "wait6", "wait7"],
+  happy: ["smile1", "smile2", "smile3", "smile4"],
+  shy: ["shy1", "shy2", "shy3", "smile2"],
+  surprised: ["surp1", "surp2", "surp3", "surp4"],
+  sad: ["sad1", "sad2", "sad3"],
+  angry: ["anger1", "anger2", "anger3"],
   thinking: ["think", "think1", "think2", "wait4", "wait"],
 };
 
@@ -78,6 +89,20 @@ const LIP: Record<Emotion, string> = {
  * Which animations show `direction` in an outfit with these `animations` (name → duration in
  * seconds). With reduced motion the body is always `wait`; faces, mouth, nods and gaze go on.
  */
+export function pickIdle(animations: ReadonlyMap<string, number>, seed = "idle"): string {
+  const names=[...animations.keys()].filter(n=>/^wait\d*$/.test(n)).sort();
+  if (!names.length) return "wait";
+  let hash=2166136261;
+  for (const ch of seed) {hash^=ch.charCodeAt(0);hash=Math.imul(hash,16777619)>>>0;}
+  return names[hash % names.length];
+}
+
+export function missingStandActions(direction: Pick<StandDirection, "bodyAction" | "faceAction" | "expression" | "mouthAction" | "restMouthAction" | "idleOnly">, animations: ReadonlySet<string>): boolean {
+  const face = direction.faceAction || direction.expression;
+  return [direction.idleOnly ? undefined : direction.bodyAction, face, direction.mouthAction, direction.restMouthAction]
+    .some(name => !!name && !animations.has(name));
+}
+
 export function pickAnimations(
   direction: StandDirection,
   animations: ReadonlyMap<string, number>,
@@ -86,14 +111,22 @@ export function pickAnimations(
   const pick = (names: string[]) => names.find((name) => animations.has(name));
   const { mood, nod } = direction;
   const k = LIP[mood];
-  const mouth = pick([`lip_${k}`, `lip_${k}1`, `lip_${k}2`, "lip_smile", "lip_wait"]) ?? anyMouth(animations);
+  const explicitFace=(direction.expression?.startsWith("face_")||direction.expression==="blank") && animations.has(direction.expression!) ? direction.expression : undefined;
+  const presetFace=direction.faceAction&&animations.has(direction.faceAction)?direction.faceAction:undefined;
+  const faceKey=explicitFace?.slice(5);
+  // Use matching original talking mouths when present. Closed-eye and other
+  // faces without a dedicated mouth keep the speech emotion's mouth.
+  const selectedMouth=direction.speaking?direction.mouthAction:direction.restMouthAction;
+  const mouth = selectedMouth&&animations.has(selectedMouth)?selectedMouth:pick([...(faceKey?[`lip_${faceKey}`]:[]),`lip_${k}`, `lip_${k}1`, `lip_${k}2`, "lip_smile", "lip_wait"]) ?? anyMouth(animations);
   const nodding = nod && pick([nod.kind, `${nod.kind}2`]);
   return {
-    body: reducedMotion ? "wait" : (direction.bodyMood ? (pick(BODY[direction.bodyMood]) ?? "wait") : direction.bodyVariant !== undefined && direction.bodyVariant % 2 === 1 && animations.has("wait") ? "wait" : (pick(BODY[mood]) ?? "wait")),
-    face: pick(FACE[mood]) ?? "blank",
+    body: reducedMotion ? "wait" : direction.idleOnly ? pickIdle(animations,direction.idleSeed) : direction.bodyAction
+      ? (animations.has(direction.bodyAction) ? direction.bodyAction : animations.has("wait") ? "wait" : pickIdle(animations, direction.idleSeed))
+      : (pick(BODY[direction.bodyMood ?? mood]) ?? "wait"),
+    face: presetFace ?? explicitFace ?? pick(FACE[mood]) ?? "blank",
     mouth: mouth ? { name: mouth, open: direction.speaking } : null,
     nod: nod && nodding ? { name: nodding, id: nod.id } : null,
-    eye: direction.looking && animations.has("eye_front") ? "eye_front" : null,
+    eye: !presetFace && !explicitFace && direction.looking && animations.has("eye_front") ? "eye_front" : null,
   };
 }
 

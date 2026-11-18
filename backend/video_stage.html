@@ -3,7 +3,6 @@
 <head>
 <meta charset="utf-8">
 <script type="importmap">{"imports":{"@/":"/src/"}}</script>
-<script src="/vendor/spine-3.6/spine-webgl.js"></script>
 <style>
 *{box-sizing:border-box}
 html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#242731;font-family:'Microsoft YaHei','Noto Sans CJK SC',sans-serif}
@@ -21,6 +20,8 @@ canvas{width:100%;height:100%;display:block}
 <div id="stage"></div><div id="sub"></div>
 <script type="module">
 import {StandEngine} from '/src/components/conversations/stand/StandEngine';
+import {loadSpineRuntime} from '/src/components/conversations/stand/spineRuntime';
+import {performancePose} from '/src/components/kaibun/performance';
 const stage=document.querySelector('#stage'),sub=document.querySelector('#sub');
 const painted=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
 let failure=null,active=null;
@@ -58,13 +59,12 @@ function subtitleLayout(text){
  measure.remove();layouts.set(text,layout);return layout;
 }
 function directionFor(item,actor,index=0){
- const segment=item.segments?.[index];
- const state=Object.assign({},...(item.segments||[]).slice(0,index+1).map(part=>part.actor_states?.[actor.id]||{}));
- const explicit=Object.keys(state).length>0;
- const mood=state.emotion||(actor.isSpeaker?segment?.emotion:undefined)||actor.mood;
- const bodyMood=explicit?('body_mood' in state?state.body_mood||undefined:actor.bodyMood):(actor.isSpeaker&&segment?segment.body_mood||undefined:actor.bodyMood);
- return {mood,bodyMood:bodyMood||undefined,bodyVariant:actor.variant,speaking:actor.speaking,looking:true,nod:null};
+ const base=actor;
+ const line={...item.line,performance_segments:item.segments||[]};
+ const pose=performancePose(line,item.segments?.[index],actor.id,base);
+ return {...pose,speaking:actor.speaking,looking:true,nod:null};
 }
+
 function direct(bank,item){
  for(const actor of item.actors){
   const slot=bank.slots.find(s=>s.actor===actor.id);
@@ -96,8 +96,7 @@ async function prepareShot(item){
   slot.node.style.display='block';slot.node.style.width=innerWidth+'px';
   slot.canvas.style.display=actor.outfit?'block':'none';slot.label.style.display=actor.outfit?'none':'flex';
   if(!actor.outfit){slot.label.textContent=actor.name||actor.id;slot.outfit=null;continue;}
-  if(!window.spine)throw Error('Spine runtime is missing; cannot export the configured stands');
-  if(!slot.engine){slot.engine=new StandEngine(slot.canvas,window.spine,'waist');slot.gl=slot.canvas.getContext('webgl');}
+  if(!slot.engine){slot.engine=new StandEngine(slot.canvas,await loadSpineRuntime(),'waist');slot.gl=slot.canvas.getContext('webgl');}
   if(slot.outfit!==actor.outfit){await slot.engine.load({id:actor.outfit,url:'/assets/spine/idols/'+actor.outfit+'/'});slot.outfit=actor.outfit;}
   slot.engine.direct(directionFor(item,actor),false);
   slot.engine.setPaused(false);
@@ -140,7 +139,17 @@ const wait=ms=>new Promise(resolve=>setTimeout(resolve,Math.max(0,ms)));
 window.playLine=async item=>{
  const started=performance.now(),duration=item.duration*1000,cueDuration=(item.cue_duration||item.duration)*1000;
  const waitUntil=async deadline=>{while(performance.now()-started<deadline){await wait(Math.min(250,deadline-(performance.now()-started)));healthy();}};
- for(const [index,segment] of (item.segments||[]).entries())if(index){await waitUntil(cueDuration*(segment.start??index/item.segments.length));window.setSegment(item,index);}
+ let currentSegment=0;
+ const events=(item.segments||[]).slice(1).map((segment,index)=>({index:index+1,at:cueDuration*(segment.start??(index+1)/item.segments.length)}));
+ for(const actor of item.actors)if(actor.speaking)events.push({actor,at:actor.voiceDuration*1000});
+ for(const event of events.sort((first,second)=>first.at-second.at)){
+  await waitUntil(event.at);
+  if(event.actor){
+   event.actor.speaking=false;
+   const slot=active.slots.find(slot=>slot.actor===event.actor.id);
+   slot?.engine?.direct(directionFor(item,event.actor,currentSegment),false);
+  }else{currentSegment=event.index;window.setSegment(item,currentSegment);}
+ }
  await waitUntil(duration);return {started:started/1000,ended:performance.now()/1000};
 };
 window.prepare=async entries=>{
@@ -169,7 +178,7 @@ window.renderStory=async entries=>{
   const timing=await playback;offsets.push(timing.started-start);
   console.log(JSON.stringify({progress:i+1}));healthy();
  }
- return {offsets,elapsed:performance.now()/1000-start,renderer_version:25,calibration_marker:true};
+ return {offsets,elapsed:performance.now()/1000-start,renderer_version:28,calibration_marker:true};
 };
 window.exportState=()=>{healthy();return {contexts:slots.filter(s=>s.engine).length,visible:active?.visible||[],background:active?.background||'',backgroundReady:!active?.background||(active.bg.complete&&active.bg.naturalWidth>0),subtitle:sub.textContent};};
 window.ready=true;

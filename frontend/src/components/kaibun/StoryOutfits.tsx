@@ -21,16 +21,17 @@ function loadOutfits(id: string) {
   return job;
 }
 
-export function StoryOutfits({ actors, cast, outfits, onChange }: {
+export function StoryOutfits({ actors, cast, outfits, onChange, allowAutomatic = true }: {
   actors: Actor[]; cast: string[]; outfits: Record<string, string>; onChange: (id: string, outfit: string) => void;
+  allowAutomatic?: boolean;
 }) {
   return <div className="flex flex-col gap-3">{cast.map(id => {
     const actor = actors.find(actor => actor.id === id);
-    return actor ? <OutfitPicker key={id} actor={actor} value={outfits[id] ?? ""} onChange={value => onChange(id, value)} /> : null;
+    return actor ? <OutfitPicker key={id} actor={actor} value={outfits[id] ?? ""} allowAutomatic={allowAutomatic} onChange={value => onChange(id, value)} /> : null;
   })}</div>;
 }
 
-function OutfitPicker({ actor, value, onChange }: { actor: Actor; value: string; onChange: (value: string) => void }) {
+function OutfitPicker({ actor, value, onChange, allowAutomatic }: { actor: Actor; value: string; onChange: (value: string) => void; allowAutomatic: boolean }) {
   const [open, setOpen] = useState(false);
   const [choices, setChoices] = useState<Wardrobe[] | null>(null);
   const [error, setError] = useState("");
@@ -46,7 +47,7 @@ function OutfitPicker({ actor, value, onChange }: { actor: Actor; value: string;
   return <details onToggle={event => setOpen(event.currentTarget.open)}>
     <summary className="cursor-pointer text-sm">{actor.short_name ?? actor.name} · {t.outfits}</summary>
     {open && <div className="mt-3 grid grid-cols-3 gap-2 sm:grid-cols-4">
-      <button type="button" aria-pressed={!value} onClick={() => onChange("")} className={cn("flex min-h-24 items-center justify-center rounded-lg border p-3 text-sm outline-none focus-visible:ring-3 focus-visible:ring-ring/50", !value ? "bg-muted" : "hover:bg-muted/60")}>{t.autoOutfit}</button>
+      {allowAutomatic && <button type="button" aria-pressed={!value} onClick={() => onChange("")} className={cn("flex min-h-24 items-center justify-center rounded-lg border p-3 text-sm outline-none focus-visible:ring-3 focus-visible:ring-ring/50", !value ? "bg-muted" : "hover:bg-muted/60")}>{t.autoOutfit}</button>}
       {choices?.slice(0, shown).map(outfit => <OutfitCard key={outfit.id} outfit={outfit} selected={value === outfit.id} onSelect={() => onChange(outfit.id)} />)}
       {!choices && !error && Array.from({ length: 3 }, (_, index) => <Skeleton key={index} className="h-40 w-full" />)}
     </div>}

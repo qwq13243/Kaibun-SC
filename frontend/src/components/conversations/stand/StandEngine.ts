@@ -1,6 +1,7 @@
 import type { Outfit } from "@/lib/api";
-import { CALM, pickAnimations, type Emotion, type StandDirection } from "@/lib/standAnimations";
+import { CALM, pickAnimations, pickIdle, type Emotion, type StandDirection } from "@/lib/standAnimations";
 import { FrameGate, MAX_PIXEL_RATIO, pixelRatio } from "@/lib/standFrames";
+import { numberedLimbLayers, repairOutfitRelay, resolveNumberedLimbLayers } from "./standSlots";
 
 import type {
   AnimationState,
@@ -33,8 +34,6 @@ const HEADROOM = 0.03;
 const TRACK = { body: 0, face: 1, nod: 2, eye: 3, mouth: 5 } as const;
 /** 同一条轨道上换动画时的混合时间（秒）。 */
 const MIX_SECONDS = 0.3;
-/** 开嘴、闭嘴的混合时间（秒）。 */
-const MOUTH_MIX_SECONDS = 0.1;
 /** 一帧最多推进这么久（秒）：卡了一下或者刚恢复时，动作不会一下子跳过去。 */
 const MAX_STEP_SECONDS = 0.1;
 
@@ -52,6 +51,8 @@ type Pose = {
   state: AnimationState;
   /** 这套衣装的动画，名字 → 时长（秒）。 */
   animations: ReadonlyMap<string, number>;
+  limbAlphas?: Map<Slot, number>;
+  numberedLimbs: ReturnType<typeof numberedLimbLayers>;
   /** 初始姿势下整个人的范围，取景据此计算。 */
   bounds: { x: number; y: number; width: number; height: number };
   /** 见过的剪裁，按剪裁附件记下它原本的结束插槽（见 `keepClipsEnding`）。 */
@@ -61,6 +62,7 @@ type Pose = {
 };
 
 type Shown = {
+  entrySeed?: string;
   /** 身体动作按哪种心情选的：心情变了才换身体动作。 */
   mood: Emotion | null;
   /** Requested final body animation; the current track may still be its relay. */
@@ -196,7 +198,7 @@ export class StandEngine {
     }
     let pose: Pose;
     try {
-      pose = this.read(url);
+      pose = this.read(outfit);
     } catch (error) {
       this.release(url);
       throw error;
@@ -209,13 +211,14 @@ export class StandEngine {
   }
 
   /** 读出已经下载好的一套衣装：骨架摆成初始姿势，量出整个人的范围。数据读不了时抛出。 */
-  private read(url: string): Pose {
+  private read({ id, url }: Outfit): Pose {
     const json = `${url}data.json`;
     const atlas = `${url}data.atlas`;
     const spine = this.spine;
     const loader = new spine.AtlasAttachmentLoader(this.assets.get(atlas) as TextureAtlas);
     const data = new spine.SkeletonJson(loader).readSkeletonData(this.assets.get(json) as string);
     const skeleton = new spine.Skeleton(data);
+    repairOutfitRelay(id, data, skeleton);
     if (data.findSkin("normal")) skeleton.setSkinByName("normal");
     skeleton.setToSetupPose();
     skeleton.updateWorldTransform();
@@ -230,6 +233,7 @@ export class StandEngine {
       data,
       state: new spine.AnimationState(stateData),
       animations: new Map(data.animations.map((a) => [a.name, a.duration])),
+      numberedLimbs: numberedLimbLayers(skeleton),
       bounds: { x: offset.x, y: offset.y, width: size.x, height: size.y },
       clips: new Map(),
       // 立绘到之前的点头已经过去了，不补。
@@ -310,14 +314,21 @@ export class StandEngine {
   private follow(pose: Pose): void {
     const { state, shown } = pose;
     const want = pickAnimations(this.direction, pose.animations, this.reducedMotion);
-    if (shown.body !== want.body) {
+    if(this.direction.idleOnly&&!this.reducedMotion){
+      const valid=new Map([...pose.animations].filter(([n])=>n==='wait'||(/^wait\d+$/.test(n)&&!!this.event(pose.data,n,'loop_start'))));
+      want.body=pickIdle(valid,this.direction.idleSeed);
+    }
+    const entering=!!this.direction.entrySeed && shown.entrySeed!==this.direction.entrySeed;
+    shown.entrySeed=this.direction.entrySeed;
+    const idleEntrance=!!(this.direction.idleOnly||this.direction.idleEntrance);
+    if (shown.body !== want.body || (entering && idleEntrance)) {
       shown.mood = this.direction.mood;
-      this.playBody(pose, want.body);
+      this.playBody(pose, want.body, entering && idleEntrance);
     }
     if (shown.face !== want.face) {
       shown.face = want.face;
       // 衣装连 `blank` 都没有时清空这条轨道，同样把脸交还给身体动作。
-      if (pose.animations.has(want.face)) state.setAnimation(TRACK.face, want.face, true);
+      if (pose.animations.has(want.face)) state.setAnimation(TRACK.face, want.face, true).mixDuration = 0;
       else state.setEmptyAnimation(TRACK.face, MIX_SECONDS);
     }
     const mouth = want.mouth && `${want.mouth.name} ${want.mouth.open ? "open" : "shut"}`;
@@ -327,7 +338,7 @@ export class StandEngine {
       // 身体动作里的嘴部变形会透出来，停了嘴还在微微动。冻结用 `animationEnd = 0` 而不是
       // `timeScale = 0`：3.6 的混合进度按 timeScale 走，为 0 时混合永远走不完，上一段说话口型会一直在底下播。
       const entry = state.setAnimation(TRACK.mouth, want.mouth.name, want.mouth.open);
-      entry.mixDuration = MOUTH_MIX_SECONDS;
+      entry.mixDuration = 0;
       if (!want.mouth.open) entry.animationEnd = 0;
     }
     if (shown.eye !== want.eye) {
@@ -346,17 +357,32 @@ export class StandEngine {
 
   /**
    * 换身体动作。带 `loop_start` 事件的，开头播一次，之后从 `loop_start` 起循环尾段；没有的整段循环。
-   * 离开带 `relay` 事件的动作时，先播它指定的 `arm_down*` 把抬起的手放下，再接下一个动作。
+   * 按素材的 relay 收势后接目标动作的原生进入段，不插入额外 wait。
+   * 不能跳到 loop_start 混合姿态：手臂的位移、显隐和形变必须随进入段同步推进。
    */
-  private playBody({ state, data, animations, shown }: Pose, name: string): void {
-    if (!animations.has(name)) return;
+  private playBody({ state, data, animations, shown }: Pose, name: string, idleEntrance=false): void {
+    if (!animations.has(name)) {
+      if (state.getCurrent(TRACK.body)) state.setEmptyAnimation(TRACK.body, MIX_SECONDS);
+      shown.body = name;
+      shown.relay = null;
+      return;
+    }
     const current = state.getCurrent(TRACK.body);
+    if ((!current || idleEntrance) && /^wait\d*$/.test(name)) {
+      const marker=this.event(data,name,"loop_start");
+      const entry=state.setAnimation(TRACK.body,name,true);
+      entry.mixDuration=0;
+      if(marker) {entry.animationStart=marker.time;entry.trackTime=0;}
+      shown.body=name;shown.relay=null;
+      return;
+    }
     if (current?.animation.name === name && !current.next) {
       shown.body = name;
       shown.relay = null;
       return;
     }
     const relay = current && this.event(data, current.animation.name, "relay");
+    const loopStart = this.event(data, name, "loop_start");
     let entry: TrackEntry;
     if (current && shown.relay === current.animation.name) {
       // Preserve the active lowering animation; only replace its queued destination.
@@ -372,7 +398,6 @@ export class StandEngine {
       shown.relay = null;
     }
     shown.body = name;
-    const loopStart = this.event(data, name, "loop_start");
     if (!loopStart) {
       entry.loop = true;
       return;
@@ -432,13 +457,83 @@ export class StandEngine {
     gl.clear(gl.COLOR_BUFFER_BIT);
 
     pose.state.update(step);
-    pose.state.apply(pose.skeleton);
+    this.applyPose(pose);
     pose.skeleton.updateWorldTransform();
     this.keepClipsEnding(pose);
     this.aim(pose, width / height);
     renderer.begin();
     renderer.drawSkeleton(pose.skeleton, true);
     renderer.end();
+  }
+
+  private applyPose(pose: Pose): void {
+    // Display-only handoff decisions must not become the next animation's
+    // authored state: many clips never key the hand slot's alpha at all.
+    for(const [slot,alpha] of pose.limbAlphas||[])slot.color.a=alpha;
+    pose.state.apply(pose.skeleton);
+    pose.limbAlphas=this.resolveLimbLayers(pose.skeleton, pose.numberedLimbs);
+    const mouth=pose.state.getCurrent(TRACK.mouth);
+    if(mouth){
+      const deformed=new Set((mouth.animation.timelines||[]).flatMap(t=>'frameVertices' in t&&'slotIndex' in t&&typeof t.slotIndex==='number'?[t.slotIndex]:[]));
+      for(const slot of pose.skeleton.slots){
+        if(/mouth|mouse/i.test(slot.data.name||'')&&!deformed.has(slot.data.index)&&slot.attachmentVertices)slot.attachmentVertices.length=0;
+      }
+    }
+  }
+
+  private resolveLimbLayers(skeleton: Skeleton, numbered: Pose["numberedLimbs"]): Map<Slot,number> {
+    const authored=new Map<Slot,number>();
+    const setAlpha=(slot:Slot,alpha:number)=>{
+      if(slot.color.a===alpha)return;
+      if(!authored.has(slot))authored.set(slot,slot.color.a);
+      slot.color.a=alpha;
+    };
+    resolveNumberedLimbLayers(numbered.paired, setAlpha);
+    const groups=new Map<string,{slot:Slot;variant:string}[]>();
+    for(const slot of skeleton.slots){
+      if(numbered.slots.has(slot))continue;
+      const name=slot.data.name||'',tokens=name.toLowerCase().split('_');
+      const side=/(?:^|_)([LR])\d*(?:_|$)/i.exec(name)?.[1].toUpperCase();
+      const part=tokens.includes('hand')?'hand':tokens.includes('arm')?['top','bottom','wrist'].find(p=>tokens.includes(p)):undefined;
+      if(name.startsWith('_')||!side||!part||!slot.getAttachment()||slot.color.a<=0.00001)continue;
+      let variant=/(?:^|_)(pocket|up|down|fold)\d*(?:_|$)/i.exec(name)?.[1].toLowerCase();
+      // A front/back/fist hand can share its forearm's branch even when its
+      // sprite name does not say up/down. Follow the actual rig hierarchy.
+      for(let bone=slot.bone;!variant&&bone;bone=bone.parent||undefined){
+        variant=/(?:^|_)(pocket|up|down|fold)\d*(?:_|$)/i.exec(bone.data.name)?.[1].toLowerCase();
+      }
+      const key=`${part==='hand'?'hand':'arm_'+part}:${side}`;
+      const rows=groups.get(key)||[];rows.push({slot,variant:variant||''});groups.set(key,rows);
+    }
+    for(const [key,rows] of groups){
+      if(!key.startsWith('arm_')||rows.length<2||!rows.some(r=>r.slot.color.a<0.99999))continue;
+      const winner=rows.reduce((best,row)=>row.slot.color.a>=best.slot.color.a?row:best);
+      for(const row of rows)setAlpha(row.slot,row===winner?1:0);
+      if(key.startsWith('arm_bottom:')){
+        const hands=groups.get('hand:'+key.split(':')[1])||[];
+        const matching=hands.filter(hand=>hand.variant===winner.variant);
+        for(const hand of hands){
+          // A fully opaque hand is sometimes intentionally reused by an up
+          // pose despite its down-named slot (for example Rinze's sad1).
+          if(hand.variant!==winner.variant&&(matching.length||hand.slot.color.a<0.99999))setAlpha(hand.slot,0);
+        }
+        if(matching.length===1)setAlpha(matching[0].slot,1);
+        else if(matching.length>1&&matching.some(hand=>hand.slot.color.a<0.99999)){
+          const chosen=matching.reduce((best,hand)=>hand.slot.color.a>=best.slot.color.a?hand:best);
+          for(const hand of matching)setAlpha(hand.slot,hand===chosen?1:0);
+        }
+      }
+    }
+    // Hand gesture sprites may cross-fade while the forearm keeps the same
+    // branch. Resolve that handoff independently of an arm-layer handoff.
+    for(const [key,rows] of groups){
+      if(!key.startsWith('hand:'))continue;
+      const visible=rows.filter(row=>row.slot.color.a>0.00001);
+      if(visible.length<2||!visible.some(row=>row.slot.color.a<0.99999))continue;
+      const winner=visible.reduce((best,row)=>row.slot.color.a>=best.slot.color.a?row:best);
+      for(const row of visible)setAlpha(row.slot,row===winner?1:0);
+    }
+    return authored;
   }
 
   /** 按取景对准镜头：贴着头顶，高度是身体的一段，宽度不窄于身体的约 70%，左右居中；全身时整个人居中。 */

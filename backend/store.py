@@ -39,6 +39,9 @@ class StoryStore:
                 if doc["status"] in ("queued", "generating", "preparing"):
                     doc.update(status="interrupted", phase="生成中断，可以继续", error=None)
                     db.execute("UPDATE stories SET document=? WHERE id=?", (json.dumps(doc, ensure_ascii=False), id))
+                if (doc.get('production') or {}).get('active'):
+                    doc['production'].update(active=False,voices_active=False,staging_active=False,staging_retrying=False,voice_retrying=False)
+                    db.execute("UPDATE stories SET document=? WHERE id=?", (json.dumps(doc, ensure_ascii=False), id))
 
     @contextmanager
     def connect(self):
