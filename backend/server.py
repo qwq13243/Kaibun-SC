@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).parent))
-from paths import data_root, load_environment, runtime_connection
+from paths import SPINE_RUNTIME, data_root, load_environment, runtime_connection
 load_environment()
 
 from adapters import ProjectAdapter  # noqa: E402 - local read-only adapter requires the project path
@@ -31,7 +31,7 @@ from stage_states import scene_shots
 from video_export import VideoExport  # noqa: E402
 from voice_errors import voice_failure
 from production_state import story_work
-from outfit_policy import OutfitMode, Season, load_seasonal_outfits, season_outfit
+from outfit_policy import OutfitMode, OutfitSlot, SceneOutfitProfile, load_seasonal_outfits, outfit_preferences, save_outfit_preference, season_outfit
 from scene_production import apply_scene_outfits
 
 
@@ -282,6 +282,29 @@ def create_app(store, adapter, api_token=None):
         if cid not in adapter.characters:
             raise HTTPException(404, "没有这个人物")
         return adapter.outfits(cid)
+
+    def wardrobe_settings(settings):
+        return dict(**settings, preview_runtime=SPINE_RUNTIME.is_file())
+
+    @app.get('/outfit-defaults')
+    async def get_outfit_defaults():
+        return wardrobe_settings(outfit_preferences())
+
+    class DefaultOutfitEdit(BaseModel):
+        character: str
+        slot: OutfitSlot
+        outfit: str | None
+
+    @app.post('/outfit-defaults')
+    async def set_outfit_default(body: DefaultOutfitEdit):
+        if body.character not in adapter.characters:
+            raise HTTPException(422, '请选择有效角色')
+        if body.outfit is not None and not adapter.outfit(body.character, body.outfit):
+            raise HTTPException(422, '请选择该角色已完整下载的衣装')
+        try:
+            return wardrobe_settings(save_outfit_preference(body.character, body.slot, body.outfit))
+        except OSError:
+            raise HTTPException(500, '无法保存衣装设置，请检查本机数据目录是否可写') from None
 
     @app.get("/wardrobe/{category}/{number}.png")
     async def outfit_thumbnail(category: str, number: str, request: Request):
@@ -665,7 +688,7 @@ def create_app(store, adapter, api_token=None):
         return presentation(doc)
 
     class SceneSeason(BaseModel):
-        season: Season
+        season: SceneOutfitProfile
         apply_later: bool = True
 
     @app.post("/stories/{id}/scenes/{index}/outfit-season")

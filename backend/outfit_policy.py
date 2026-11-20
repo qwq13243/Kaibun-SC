@@ -3,11 +3,15 @@ import json
 import logging
 from pathlib import Path
 from typing import Literal
+from uuid import uuid4
+
+from paths import data_root
 
 
 AUTO_EXCLUDED = frozenset({'stand/1030230010', 'stand/1030240010'})
 DAILY_DEFAULTS = {'hinana': 'stand/1040230010', 'nichika': 'stand/1030240020'}
-Season = Literal['spring', 'summer', 'autumn', 'winter']
+OutfitSlot = Literal['spring', 'summer', 'autumn', 'winter', 'special']
+SceneOutfitProfile = Literal['default', 'spring', 'summer', 'autumn', 'winter']
 OutfitMode = Literal['story', 'fixed', 'default', 'spring', 'summer', 'autumn', 'winter']
 SEASONS = ('spring', 'summer', 'autumn', 'winter')
 PROFILES = (*SEASONS, 'special')
@@ -26,15 +30,48 @@ def automatic_outfit(oid):
     return oid not in AUTO_EXCLUDED
 
 
-def load_seasonal_outfits():
-    path = Path(__file__).resolve().parents[1] / 'config' / 'seasonal_outfits.json'
+def read_outfit_table(path):
     if not path.is_file():
         return {}
     return json.loads(path.read_text(encoding='utf-8'))['default_outfits']
 
 
+def custom_outfits_path():
+    return data_root() / 'outfit_defaults.json'
+
+
+def outfit_preferences():
+    built_in = read_outfit_table(Path(__file__).resolve().parents[1] / 'config' / 'seasonal_outfits.json')
+    custom = read_outfit_table(custom_outfits_path())
+    return dict(default_outfits={cid: {**built_in.get(cid, {}), **custom.get(cid, {})}
+                                 for cid in dict.fromkeys([*built_in, *custom])}, overrides=custom)
+
+
+def save_outfit_preference(cid, slot, outfit):
+    path = custom_outfits_path()
+    custom = read_outfit_table(path)
+    if outfit is None:
+        row = custom.get(cid, {})
+        row.pop(slot, None)
+        if not row:
+            custom.pop(cid, None)
+    else:
+        custom.setdefault(cid, {})[slot] = outfit
+    temporary = path.with_suffix(f'.{uuid4().hex}.tmp')
+    try:
+        temporary.write_text(json.dumps(dict(version=1, default_outfits=custom), ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return outfit_preferences()
+
+
+def load_seasonal_outfits():
+    return outfit_preferences()['default_outfits']
+
+
 def season_outfit(seasonal, outfit, cid, season):
-    oid = seasonal.get(cid, {}).get(season)
+    oid = seasonal.get(cid, {}).get('special' if season == DEFAULT_PROFILE else season)
     return oid if isinstance(oid, str) and outfit(cid, oid) else None
 
 
@@ -50,7 +87,6 @@ class StoryOutfits:
         self.outfit = outfit
         self.outfits = outfits
         self.selector = selector
-        self.seasonal = load_seasonal_outfits()
 
     def valid(self, cid, oid):
         return isinstance(oid, str) and bool(self.outfit(cid, oid))
@@ -81,10 +117,11 @@ class StoryOutfits:
         doc['outfit_profile'] = profile
         return profile
 
-    def default(self, cid, profile):
+    def default(self, cid, profile, seasonal):
         original = DAILY_DEFAULTS.get(cid, getattr(self.characters.get(cid), 'default_outfit', None))
-        category = 'special' if profile == DEFAULT_PROFILE else profile
-        if (oid := season_outfit(self.seasonal, self.outfit, cid, category)) and automatic_outfit(oid):
+        if oid := season_outfit(seasonal, self.outfit, cid, profile):
+            return oid
+        if profile in SEASONS and (oid := season_outfit(seasonal, self.outfit, cid, DEFAULT_PROFILE)):
             return oid
         if automatic_outfit(original) and self.valid(cid, original):
             return original
@@ -92,6 +129,7 @@ class StoryOutfits:
 
     async def scene_choices(self, doc, scene, actors, previous, fixed):
         outfits = dict(scene.get('outfits') or {})
+        seasonal = load_seasonal_outfits()
         mode = doc.get('outfit_mode', 'story')
         local = mode in LOCAL_MODES
         requested = doc.get('requested_outfits') or {}
@@ -103,13 +141,14 @@ class StoryOutfits:
             if selected is not None:
                 outfits[cid] = selected
             else:
+                outfits.pop(cid, None)
                 pending.append(cid)
         profile = mode if local else DEFAULT_PROFILE
-        if not local and any(self.valid(cid, oid) and automatic_outfit(oid)
-               for cid in pending for oid in self.seasonal.get(cid, {}).values()):
+        if not local and any(self.valid(cid, oid)
+               for cid in pending for oid in seasonal.get(cid, {}).values()):
             profile = await self.profile(doc)
         for cid in pending:
-            oid = season_outfit(self.seasonal, self.outfit, cid, mode) if mode in SEASONS else self.default(cid, profile)
+            oid = self.default(cid, profile, seasonal)
             if oid:
                 outfits[cid] = oid
         return outfits

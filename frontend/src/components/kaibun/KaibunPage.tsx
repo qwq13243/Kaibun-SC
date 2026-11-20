@@ -185,7 +185,7 @@ export function KaibunPage() {
               <div className="flex flex-col gap-2 text-sm">
                 <label>服装安排 <select className="ml-2 rounded border bg-background p-2" value={outfitMode} onChange={event => setOutfitMode(composerOutfitMode(event.target.value))}>
                   <option value="story">随剧情换装</option>
-                  <option value="default">默认衣装（特殊）</option>
+                  <option value="default">默认衣装</option>
                   <optgroup label="季节配装">{Object.entries(seasons).map(([id, label]) => <option key={id} value={id}>{label}</option>)}</optgroup>
                 </select></label>
                 <p className="text-muted-foreground">单独手选的角色衣装优先。</p>

@@ -131,8 +131,6 @@ class SceneProduction:
         return True
 
     def check_assets(self,scene):
-        for cid,oid in scene.get('outfits',{}).items():
-            if not self.valid_outfit(cid,oid):raise SceneProductionError('已保存的衣装素材缺失，请检查后继续')
         for bid in [scene.get('background'),*scene.get('background_changes',{}).values()]:
             if bid is not None and not self.project.backgrounds.image_path(bid):raise SceneProductionError('已保存的背景素材缺失，请检查后继续')
 

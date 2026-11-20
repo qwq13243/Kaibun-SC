@@ -15,6 +15,7 @@ import uuid
 from array import array
 from pathlib import Path
 
+from paths import SPINE_RUNTIME
 from production import cached_audio, voice_inventory, voice_lines, voice_targets, Production
 from stage_states import cast_for, scene_shots
 
@@ -109,7 +110,23 @@ class VideoExport:
             stat = path.stat()
             voices.append((line['id'], path.name, stat.st_size, stat.st_mtime_ns))
         data = {'version': 31, 'scenes': doc['scenes'], 'outline': doc.get('outline'), 'voices': voices}
+        missing = self.requested_outfits(doc) - self.available_outfits(doc)
+        if missing:
+            data['unavailable_outfits'] = sorted(missing)
         return hashlib.sha256(json.dumps(data, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+
+    def requested_outfits(self, doc):
+        cast = (doc.get('outline') or {}).get('cast', [])
+        outfits = {(cid, self.adapter.characters[cid].default_outfit) for cid in cast if cid in self.adapter.characters}
+        for scene in doc['scenes']:
+            for outfit_map in [scene.get('outfits') or {}, *(scene.get('outfit_changes') or {}).values()]:
+                outfits.update(outfit_map.items())
+        return {(cid, oid) for cid, oid in outfits if oid}
+
+    def available_outfits(self, doc):
+        if not SPINE_RUNTIME.is_file():
+            return set()
+        return {(cid, oid) for cid, oid in self.requested_outfits(doc) if self.adapter.outfit(cid, oid)}
 
     def output_path(self, doc):
         key = doc.get('export_id', doc['id'])
@@ -183,21 +200,32 @@ class VideoExport:
             if not entries:
                 raise ValueError('这篇故事还没有可以导出的对话')
             job['message'] = '正在合成画面与声音'
-            output = self.directory / (doc.get('export_id', sid) + '.mp4')
-            await asyncio.to_thread(self.record, doc, entries, exe, output, job)
-            meta = self.directory / (doc.get('export_id', sid) + '.json')
+            export_id = doc.get('export_id', sid)
+            output = self.directory / (export_id + '.mp4')
+            checkpoint = self.directory / 'checkpoints' / export_id / str(fingerprint)
+            await asyncio.to_thread(self.record, doc, entries, exe, output, job, checkpoint)
+            meta = self.directory / (export_id + '.json')
             temp = meta.with_suffix('.json.tmp')
             temp.write_text(json.dumps({'fingerprint': fingerprint}), encoding='utf-8')
             temp.replace(meta)
+            await asyncio.to_thread(self.clear_checkpoint, checkpoint)
             job.update(status='ready', progress=100, message='导出完成')
         except Exception as exc:
             (self.directory / (doc.get('export_id', sid) + '-error.log')).write_text(traceback.format_exc(), encoding='utf-8')
             job.update(status='failed', message=str(exc) if isinstance(exc, ValueError) else '导出失败，请检查本地素材与视频组件后重试')
 
-    def record(self, doc, entries, exe, output, job):
+    def clear_checkpoint(self, checkpoint):
+        try:
+            root = self.directory.resolve() / 'checkpoints'
+            expected = root / checkpoint.parent.name / checkpoint.name
+            if checkpoint.resolve() == expected:
+                shutil.rmtree(expected, ignore_errors=True)
+                expected.parent.rmdir()
+        except (OSError, RuntimeError):
+            pass
+
+    def record(self, doc, entries, exe, output, job, checkpoint):
         # Completed clips survive failures, cancellation and server restarts.
-        key = self.fingerprint(doc)
-        checkpoint = self.directory / 'checkpoints' / doc.get('export_id', doc['id']) / str(key)
         checkpoint.mkdir(parents=True, exist_ok=True)
         parts = []
         for start in [0]:
@@ -238,6 +266,7 @@ class VideoExport:
         cast = (doc.get('outline') or {}).get('cast', [])
         items, sounds = [], []
         active_scene = None
+        available_outfits = self.available_outfits(doc)
         for scene, line, audio_files in entries:
             new_scene = scene is not active_scene
             if new_scene:
@@ -270,7 +299,7 @@ class VideoExport:
             for cid in shot:
                 character = self.adapter.characters.get(cid)
                 oid = outfits.get(cid) or getattr(character, 'default_outfit', None)
-                if not oid or oid not in self.adapter.wardrobe.entries:
+                if (cid, oid) not in available_outfits:
                     actors.append(dict(id=cid, name=getattr(character, 'short_name', None) or getattr(character, 'name', cid), outfit=None, speaking=False, isSpeaker=cid in (line.get('speakers') or [line.get('speaker')]), mood='calm', bodyVariant=0, bodyMood=None))
                     continue
                 visual = frame['poses'][cid]

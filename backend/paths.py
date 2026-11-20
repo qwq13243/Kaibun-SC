@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+SPINE_RUNTIME = ROOT / 'frontend/public/vendor/spine-3.6/spine-webgl.js'
 
 def project_path(value):
     path = Path(value).expanduser()

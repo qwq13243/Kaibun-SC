@@ -34,60 +34,91 @@ class Wardrobe:
         self._holds = {}
         self._pending = {}
         self._worker = None
-        manifest = adapter.asset_root.parent / "spine_manifest.json"
+        self._manifest = adapter.asset_root.parent / "spine_manifest.json"
+        self._manifest_version = None
+        self.refresh_catalog()
+        self.index = OutfitIndex(self)
+
+    def refresh_catalog(self):
         try:
-            entries = json.loads(manifest.read_text(encoding="utf-8"))
+            stat = self._manifest.stat()
+            version = (stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            version = ()
+        if version == self._manifest_version:
+            return
+        try:
+            entries = json.loads(self._manifest.read_text(encoding="utf-8")) if version else []
         except (OSError, ValueError):
-            entries = []
-        idols = {c.idol_id: cid for cid, c in adapter.characters.items() if c.idol_id is not None}
+            return
+        if not isinstance(entries, list):
+            return
+        self.entries.clear()
+        self.by_character = {cid: [] for cid in self.adapter.characters}
+        self._bounds.clear()
+        self._clips.clear()
+        self._holds.clear()
+        idols = {c.idol_id: cid for cid, c in self.adapter.characters.items() if c.idol_id is not None}
         for entry in entries:
-            cid = idols.get(entry.get("idolId"))
+            if not isinstance(entry, dict) or not isinstance(entry.get('path'), str):
+                continue
+            idol_id = entry.get('idolId')
+            cid = idols.get(idol_id) if isinstance(idol_id, (int, str)) else None
             oid = entry.get("path", "").removeprefix("spine/idols/").rstrip("/")
             if not cid or not OUTFIT_ID.fullmatch(oid):
-                continue
-            root = adapter.asset_root / "spine" / "idols" / oid
-            if not all((root / name).is_file() for name in ("data.json", "data.atlas", "data.png")):
                 continue
             self.entries[oid] = dict(entry)
             if oid not in self.by_character[cid]:
                 self.by_character[cid].append(oid)
         # A configured default can be usable even when a mirror's manifest is older.
-        for cid, character in adapter.characters.items():
+        for cid, character in self.adapter.characters.items():
             oid = character.default_outfit
             if oid and OUTFIT_ID.fullmatch(oid) and oid not in self.entries:
-                root = adapter.asset_root / "spine" / "idols" / oid
-                if all((root / name).is_file() for name in ("data.json", "data.atlas", "data.png")):
-                    self.entries[oid] = {"dressName": "默认衣装", "idolId": character.idol_id}
-                    self.by_character[cid].append(oid)
-
-        self.index = OutfitIndex(self)
+                self.entries[oid] = {"dressName": "默认衣装", "idolId": character.idol_id}
+                self.by_character[cid].append(oid)
+        self._manifest_version = version
 
     def outfits(self, cid):
-        return [self.outfit(cid, oid) for oid in self.by_character.get(cid, [])]
+        self.refresh_catalog()
+        return [row for oid in self.by_character.get(cid, []) if (row := self.outfit(cid, oid)) is not None]
 
     def outfit(self, cid, oid):
+        self.refresh_catalog()
         if not isinstance(oid, str) or oid not in self.by_character.get(cid, []):
             return None
-        if oid not in self._bounds:
+        root = self.adapter.asset_root / 'spine' / 'idols' / oid
+        try:
+            model = root / 'data.json'
+            stat = model.stat()
+            if not stat.st_size or not all((root / name).is_file() and (root / name).stat().st_size
+                                           for name in ('data.atlas', 'data.png')):
+                return None
+        except OSError:
+            return None
+        version = (stat.st_mtime_ns, stat.st_size)
+        if oid not in self._bounds or self._bounds[oid][0] != version:
+            bounds = None
             try:
-                source = json.loads((self.adapter.asset_root / "spine" / "idols" / oid / "data.json").read_text(encoding="utf-8"))
+                source = json.loads(model.read_text(encoding='utf-8'))
+                data = source['skeleton']
+                if not isinstance(data, dict):
+                    return None
                 if isinstance(animations := source.get('animations'), dict):
                     from visual_fields import is_hold_action
                     self._clips[oid] = list(animations)
                     self._holds[oid] = [name for name, clip in animations.items() if is_hold_action(name, clip)]
-                data = source["skeleton"]
-                width, height = float(data["width"]), float(data["height"])
-                if not 0 < width < 100000 or not 0 < height < 100000:
-                    raise ValueError()
-                self._bounds[oid] = dict(width=width, height=height)
+                width, height = float(data.get('width', 0)), float(data.get('height', 0))
+                if 0 < width < 100000 and 0 < height < 100000:
+                    bounds = dict(width=width, height=height)
             except (OSError, ValueError, KeyError, TypeError):
-                self._bounds[oid] = None
+                return None
+            self._bounds[oid] = (version, bounds)
         name = self.entries[oid].get("dressName", oid)
         kind = "舞台衣装" if oid.startswith("stand_costume/") else "日常衣装"
         return dict(id=oid, url=f"/api/kaibun/stand/{oid}/",
                     animation_names=self._clips.get(oid),
                     hold_actions=self._holds.get(oid,[]),
-                    thumbnail=f"/api/kaibun/wardrobe/{oid}.png", bounds=self._bounds[oid],
+                    thumbnail=f"/api/kaibun/wardrobe/{oid}.png", bounds=self._bounds[oid][1],
                     label=f"{name} · {kind}")
 
     def thumbnail_path(self, oid):

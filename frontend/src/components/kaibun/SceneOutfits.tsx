@@ -4,11 +4,13 @@ import { StoryOutfits } from "./StoryOutfits";
 import { request, seasons, type Season, type Actor, type Story } from "./api";
 import { reviewOutfitActions } from "./outfitActionReview";
 
+const profiles = { default: "默认衣装", ...seasons };
+
 export function SceneOutfits({story, actors, onUpdated, onPreview}: {story:Story; actors:Actor[]; onUpdated:(s:Story)=>void; onPreview:(id:string)=>void}) {
   const [scene,setScene]=useState(0);
   const [character,setCharacter]=useState(story.outline?.cast[0] || "");
   const [later,setLater]=useState(true);
-  const [season,setSeason]=useState<Season | "">("");
+  const [season,setSeason]=useState<Season | "default" | "">("");
   const [busy,setBusy]=useState(false);
   const [notice,setNotice]=useState("");
   const [error,setError]=useState("");
@@ -33,8 +35,8 @@ export function SceneOutfits({story, actors, onUpdated, onPreview}: {story:Story
       const result=await request<{story:Story;applied:string[];skipped:string[]}>(`stories/${story.id}/scenes/${scene}/outfit-season`, {season,apply_later:later,base_fingerprint:story.base_fingerprint});
       updated(result.story);
       const skipped=result.skipped.map(id=>actors.find(actor=>actor.id===id)?.name || id);
-      const summary=result.applied.length ? `已为 ${result.applied.length} 位角色应用${seasons[season]}。` : `没有可应用的${seasons[season]}。`;
-      setNotice(summary+(skipped.length ? `${skipped.join("、")}缺少对应素材，原衣装不变。` : ""));
+      const summary=result.applied.length ? `已为 ${result.applied.length} 位角色应用${profiles[season]}。` : `没有可应用的${profiles[season]}。`;
+      setNotice(summary+(skipped.length ? `${skipped.join("、")}未设置该类衣装或素材未安装，原衣装不变。` : ""));
     } catch (error) { setError(error instanceof Error ? error.message : "批量换装失败"); }
     finally { setBusy(false); }
   }
@@ -44,11 +46,11 @@ export function SceneOutfits({story, actors, onUpdated, onPreview}: {story:Story
       <label className="text-sm"><input type="checkbox" checked={later} onChange={e=>setLater(e.target.checked)} /> 同时应用到后续幕</label>
       <StoryOutfits actors={actors} cast={character?[character]:[]} outfits={story.scenes[scene]?.outfits || {}} allowAutomatic={false} onChange={(_,outfit)=>{void saveOutfit(outfit);}} />
       <div className="flex flex-col gap-2 border-t pt-3">
-        <div className="flex flex-wrap items-center gap-3"><label>季节配装 <select className="rounded border bg-background p-2" value={season} onChange={event=>setSeason(event.target.value as Season | "")}>
-          <option value="">请选择季节</option>
-          {Object.entries(seasons).map(([id,label])=><option key={id} value={id}>{label}</option>)}
+        <div className="flex flex-wrap items-center gap-3"><label>默认与季节衣装 <select className="rounded border bg-background p-2" value={season} onChange={event=>setSeason(event.target.value as Season | "default" | "")}>
+          <option value="">请选择分类</option>
+          {Object.entries(profiles).map(([id,label])=><option key={id} value={id}>{label}</option>)}
         </select></label><Button type="button" variant="outline" disabled={!season || busy || !story.outline?.cast.length} onClick={()=>{void applySeason();}}>应用到所有角色</Button></div>
-        <p className="text-sm text-muted-foreground">使用你之前设定的季节衣装，替换所选幕范围内已有的衣装（包括手选）。</p>
+        <p className="text-sm text-muted-foreground">应用后会替换所选范围内的原衣装，包括手选；不重做配音。</p>
       </div>
     </fieldset>
     {notice && <p role="status" className="text-sm">{notice}</p>}

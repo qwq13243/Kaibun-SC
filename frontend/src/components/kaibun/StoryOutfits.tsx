@@ -3,23 +3,10 @@ import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { copy } from "@/i18n";
 import { cn } from "@/lib/utils";
-import { type Actor, type Wardrobe } from "./api";
+import { request, type Actor, type Wardrobe } from "./api";
 
 const t = copy.kaibun;
-const catalogs = new Map<string, Promise<Wardrobe[]>>();
 const pageSize = 12;
-
-function loadOutfits(id: string) {
-  const cached = catalogs.get(id);
-  if (cached) return cached;
-  const job = fetch("/api/kaibun/characters/" + encodeURIComponent(id) + "/outfits")
-    .then(async response => {
-      if (!response.ok) throw new Error(t.unavailable);
-      return response.json() as Promise<Wardrobe[]>;
-    }).catch(error => { catalogs.delete(id); throw error; });
-  catalogs.set(id, job);
-  return job;
-}
 
 export function StoryOutfits({ actors, cast, outfits, onChange, allowAutomatic = true }: {
   actors: Actor[]; cast: string[]; outfits: Record<string, string>; onChange: (id: string, outfit: string) => void;
@@ -41,7 +28,7 @@ function OutfitPicker({ actor, value, onChange, allowAutomatic }: { actor: Actor
     if (!open) return;
     let active = true;
     setError("");
-    loadOutfits(actor.id).then(data => { if (active) setChoices(data); }).catch(e => { if (active) setError(e.message); });
+    request<Wardrobe[]>(`characters/${encodeURIComponent(actor.id)}/outfits`).then(data => { if (active) setChoices(data); }).catch(e => { if (active) setError(e.message); });
     return () => { active = false; };
   }, [open, actor.id, attempt]);
   return <details onToggle={event => setOpen(event.currentTarget.open)}>
@@ -52,6 +39,7 @@ function OutfitPicker({ actor, value, onChange, allowAutomatic }: { actor: Actor
       {!choices && !error && Array.from({ length: 3 }, (_, index) => <Skeleton key={index} className="h-40 w-full" />)}
     </div>}
     {open && choices && shown < choices.length && <Button type="button" variant="ghost" className="mt-2" onClick={() => setShown(count => count + pageSize)}>{t.moreOutfits}</Button>}
+    {open && choices?.length === 0 && <p role="status" className="mt-2 text-meta text-muted-foreground">该角色还没有可用的本地衣装。</p>}
     {!choices && !error && open && <p role="status" className="mt-2 text-meta text-muted-foreground">{t.loadingOutfits}</p>}
     {open && error && <div role="alert" className="mt-2 flex items-center gap-2 text-meta text-muted-foreground">{error}<Button type="button" variant="ghost" onClick={() => setAttempt(value => value + 1)}>{t.retry}</Button></div>}
   </details>;
